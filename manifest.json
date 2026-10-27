@@ -9,7 +9,8 @@
   "permissions": [
     "tabCapture",
     "offscreen",
-    "tabs"
+    "tabs",
+    "storage"
   ],
 
   "background": {

@@ -4,9 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Tab Audio Router</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- No external font requests. Using system font stack in CSS. -->
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -20,33 +18,34 @@
     <div id="status-badge" class="status-badge status-idle">Idle</div>
   </header>
 
-  <!-- Main content area — switches between permission view and routing view -->
+  <!-- Main content area: loading → routing (or error) -->
   <main id="main-content">
 
-    <!-- ── Permission Screen ─────────────────────────────── -->
-    <section id="permission-screen" class="screen hidden">
-      <div class="permission-card">
-        <div class="permission-icon">🎙️</div>
-        <h2 class="permission-title">One-time setup required</h2>
-        <p class="permission-body">
-          To list your audio output devices (speakers, headphones, etc.),
-          Chrome requires a one-time microphone permission grant.
-          <strong>No microphone audio will be captured or stored.</strong>
-          The permission is used only to unlock device names.
-        </p>
-        <button id="grant-permission-btn" class="btn btn-primary btn-full">
-          <span class="btn-icon">🔓</span>
-          Grant Permission
-        </button>
-        <p id="permission-error" class="permission-error hidden"></p>
-      </div>
+    <!-- ── Loading ──────────────────────────────────────── -->
+    <section id="loading-screen" class="screen">
+      <div class="loading-spinner"></div>
     </section>
 
-    <!-- ── Routing Screen ────────────────────────────────── -->
+    <!-- ── Routing ──────────────────────────────────────── -->
     <section id="routing-screen" class="screen hidden">
 
+      <!--
+        Info banner — shown only when device labels are unavailable.
+        Microphone permission is OPTIONAL and is used solely to reveal
+        human-readable device names (e.g. "AirPods Pro" instead of "Device 1").
+        Routing works correctly without it; device IDs are always present.
+      -->
+      <div id="info-banner" class="info-banner hidden">
+        <span class="info-text">
+          Device names hidden by Chrome. Routing still works — devices are labelled by position.
+        </span>
+        <button id="show-names-btn" class="btn btn-ghost btn-sm" type="button">
+          Show Names
+        </button>
+      </div>
+
       <!-- Route Slot 1 -->
-      <div class="route-card" id="route-card-0" data-slot="0">
+      <div class="route-card" id="route-card-0">
         <div class="route-card-header">
           <div class="slot-label">
             <span class="slot-number">Route 1</span>
@@ -54,7 +53,6 @@
           </div>
           <span class="slot-status-text" id="slot-status-text-0">Not active</span>
         </div>
-
         <div class="route-card-body">
           <div class="field-group">
             <label class="field-label" for="tab-select-0">Tab</label>
@@ -64,7 +62,6 @@
               </select>
             </div>
           </div>
-
           <div class="field-group">
             <label class="field-label" for="device-select-0">Output Device</label>
             <div class="select-wrapper">
@@ -73,19 +70,17 @@
               </select>
             </div>
           </div>
-
           <div class="route-card-actions">
-            <button id="route-btn-0" class="btn btn-primary" data-slot="0" disabled>
+            <button id="route-btn-0" class="btn btn-primary" type="button" disabled>
               Start Routing
             </button>
           </div>
-
           <p id="slot-error-0" class="slot-error hidden"></p>
         </div>
       </div>
 
       <!-- Route Slot 2 -->
-      <div class="route-card" id="route-card-1" data-slot="1">
+      <div class="route-card" id="route-card-1">
         <div class="route-card-header">
           <div class="slot-label">
             <span class="slot-number">Route 2</span>
@@ -93,7 +88,6 @@
           </div>
           <span class="slot-status-text" id="slot-status-text-1">Not active</span>
         </div>
-
         <div class="route-card-body">
           <div class="field-group">
             <label class="field-label" for="tab-select-1">Tab</label>
@@ -103,7 +97,6 @@
               </select>
             </div>
           </div>
-
           <div class="field-group">
             <label class="field-label" for="device-select-1">Output Device</label>
             <div class="select-wrapper">
@@ -112,38 +105,31 @@
               </select>
             </div>
           </div>
-
           <div class="route-card-actions">
-            <button id="route-btn-1" class="btn btn-primary" data-slot="1" disabled>
+            <button id="route-btn-1" class="btn btn-primary" type="button" disabled>
               Start Routing
             </button>
           </div>
-
           <p id="slot-error-1" class="slot-error hidden"></p>
         </div>
       </div>
 
-      <!-- Refresh button -->
+      <!-- Toolbar -->
       <div class="toolbar">
-        <button id="refresh-btn" class="btn btn-ghost btn-sm" title="Refresh tab and device lists">
-          <span>↺</span> Refresh
+        <button id="refresh-btn" class="btn btn-ghost btn-sm" title="Refresh tab and device lists" type="button">
+          ↺ Refresh
         </button>
       </div>
 
     </section>
 
-    <!-- ── Error Screen (Chrome version / API unavailable) ─── -->
+    <!-- ── Error (unsupported browser / fatal) ──────────── -->
     <section id="error-screen" class="screen hidden">
       <div class="error-card">
         <div class="error-icon">⚠️</div>
-        <h2 class="error-title">Browser not supported</h2>
+        <h2 class="error-title">Not supported</h2>
         <p id="error-message" class="error-body"></p>
       </div>
-    </section>
-
-    <!-- ── Loading Screen ─────────────────────────────────── -->
-    <section id="loading-screen" class="screen">
-      <div class="loading-spinner"></div>
     </section>
 
   </main>

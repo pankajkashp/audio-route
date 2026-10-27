@@ -2,185 +2,261 @@
  * background.js — Service Worker
  *
  * Responsibilities:
- * - Own in-memory routing state (tabId → route info)
- * - Manage the lifecycle of the single Offscreen Document
- * - Relay START_ROUTING / STOP_ROUTING to the offscreen audio engine
- * - Clean up state when tabs close or navigate away
- * - Handle ROUTING_STOPPED notifications from the offscreen engine
- *
- * NOTE: State is ephemeral. It is NOT persisted to chrome.storage.
- * If the service worker is terminated and restarted by the browser, the
- * routing state map resets. The offscreen document (and its live
- * AudioContexts) may survive SW restart — this is a known Phase 2
- * limitation tracked as UQ-6. The popup will show empty state in that
- * scenario, and the user can re-initiate routing. This will be addressed
- * in a future phase.
+ * - Own routing state, persisted to chrome.storage.session so it survives
+ *   service worker restarts (chrome.storage.session is cleared when the
+ *   browser itself closes, which is the desired behaviour).
+ * - On startup, reconcile stored state against the live offscreen document
+ *   and open tabs to discard stale entries automatically.
+ * - Manage the lifecycle of the Offscreen Document.
+ * - Relay START_ROUTING / STOP_ROUTING to the offscreen audio engine.
+ * - Clean up state when tabs close or navigate away.
+ * - Handle ROUTING_STOPPED notifications from the offscreen engine.
  */
 
 'use strict';
 
-const MAX_ROUTES = 2;
+const MAX_ROUTES  = 2;
+const SESSION_KEY = 'routingState'; // key used in chrome.storage.session
+
+// Handle extension install/update
+chrome.runtime.onInstalled.addListener((details) => {
+  console.log(`[SW] Tab Audio Router installed/updated: ${details.reason}`);
+});
+
+// ─── In-Memory State ──────────────────────────────────────────────────────────
 
 /**
- * In-memory routing state.
+ * Primary runtime state.
  * Key: tabId (number)
  * Value: { streamId, deviceId, deviceLabel, tabTitle, tabUrl, startedAt }
  */
 const routingState = new Map();
 
-// ─── Offscreen Document Management ───────────────────────────────────────────
+// ─── State Persistence ────────────────────────────────────────────────────────
 
 /**
- * Ensures the offscreen document exists. Creates it if absent.
- * The offscreen document persists as long as there is at least one
- * active AudioContext inside it or until explicitly closed by the SW.
+ * Write the current routingState to chrome.storage.session.
+ * Called after every state mutation so that if the SW is killed by Chrome
+ * and later restarted, we can restore the state exactly.
  */
-async function ensureOffscreenDocument() {
+async function persistState() {
+  try {
+    await chrome.storage.session.set({
+      [SESSION_KEY]: [...routingState.entries()]
+    });
+  } catch (err) {
+    console.warn('[SW] persistState failed:', err.message);
+  }
+}
+
+async function clearPersistedState() {
+  try {
+    await chrome.storage.session.remove(SESSION_KEY);
+  } catch (err) {
+    console.warn('[SW] clearPersistedState failed:', err.message);
+  }
+}
+
+// ─── SW Startup: State Reconciliation ────────────────────────────────────────
+
+/**
+ * stateReady resolves when the startup reconciliation is complete.
+ * Message handlers that read/write routingState wait on this so they
+ * never see a half-initialised state.
+ */
+const stateReady = initState();
+
+async function initState() {
+  let stored;
+  try {
+    const result = await chrome.storage.session.get(SESSION_KEY);
+    stored = result[SESSION_KEY]; // [[tabId, routeInfo], ...] | undefined
+  } catch (err) {
+    console.warn('[SW] Could not read session storage during init:', err.message);
+    return;
+  }
+
+  if (!stored || stored.length === 0) return; // nothing to restore
+
+  // If the offscreen document is gone, the AudioContexts inside it are gone too.
+  // The stored state would be stale — discard it.
+  const offscreenAlive = await isOffscreenAlive();
+  if (!offscreenAlive) {
+    console.log('[SW] Offscreen not found on startup; discarding stale persisted routes.');
+    await clearPersistedState();
+    return;
+  }
+
+  // The offscreen is alive. Validate that the referenced tabs still exist
+  // (they might have been closed while the SW was sleeping).
+  let openTabs;
+  try {
+    openTabs = await chrome.tabs.query({});
+  } catch (err) {
+    console.warn('[SW] tabs.query failed during reconciliation:', err.message);
+    return;
+  }
+  const openTabIds = new Set(openTabs.map(t => t.id));
+
+  for (const [tabId, info] of stored) {
+    if (openTabIds.has(tabId)) {
+      // Tab still open and offscreen alive — restore this route.
+      routingState.set(tabId, info);
+    } else {
+      // Tab was closed while SW was sleeping; tell offscreen to clean up.
+      console.log(`[SW] Stale route for closed tab ${tabId}; sending cleanup to offscreen.`);
+      sendToOffscreen({ type: 'STOP_ROUTING', tabId })
+        .catch(err => console.warn(`[SW] Could not clean stale route for tab ${tabId}:`, err.message));
+    }
+  }
+
+  // Persist the validated (possibly reduced) set.
+  await persistState();
+
+  if (routingState.size > 0) {
+    console.log(`[SW] Restored ${routingState.size} route(s) from session storage after SW restart.`);
+  }
+}
+
+// ─── Offscreen Document Management ───────────────────────────────────────────
+
+async function isOffscreenAlive() {
+  if (chrome.offscreen?.hasDocument) {
+    return await chrome.offscreen.hasDocument();
+  }
   const existing = await chrome.runtime.getContexts({
     contextTypes: ['OFFSCREEN_DOCUMENT']
   });
-  if (existing.length > 0) return;
-
-  await chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['USER_MEDIA'],
-    justification: 'Capture and route tab audio to the selected physical output device.'
-  });
+  return existing.length > 0;
 }
 
 /**
- * Send a message to the offscreen document (creates the doc if needed).
- * @param {object} message - Must include a `type` field.
- * @returns {Promise<any>} The response from the offscreen handler.
+ * Creates the offscreen document if it does not already exist.
+ * Declared reasons:
+ *   USER_MEDIA    — we call getUserMedia(chromeMediaSource:'tab')
+ *   AUDIO_PLAYBACK — we play audio back through AudioContext + setSinkId
  */
+async function ensureOffscreenDocument() {
+  if (await isOffscreenAlive()) return;
+
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
+    justification:
+      'Capture tab audio via getUserMedia (chromeMediaSource: tab) and play it ' +
+      'through an AudioContext routed to a specific output device via setSinkId().'
+  });
+}
+
 async function sendToOffscreen(message) {
   await ensureOffscreenDocument();
   try {
     return await chrome.runtime.sendMessage({ ...message, target: 'offscreen' });
   } catch (err) {
-    // Offscreen document may have been closed or context invalidated
-    throw new Error(`Offscreen message failed: ${err.message}`);
+    throw new Error(`Offscreen message failed (${message.type}): ${err.message}`);
   }
 }
 
 // ─── Routing Operations ───────────────────────────────────────────────────────
 
-/**
- * Start routing audio from a tab to a device.
- * The stream ID must already have been obtained by the popup (which has
- * user-gesture context for tabCapture.getMediaStreamId).
- *
- * @param {number}  tabId       - ID of the tab to route
- * @param {string}  streamId    - Stream ID from tabCapture.getMediaStreamId
- * @param {string}  deviceId    - Audio output device ID for setSinkId
- * @param {string}  deviceLabel - Human-readable device name (for UI)
- * @param {string}  tabTitle    - Tab title (for UI)
- * @param {string}  tabUrl      - Tab URL (for UI)
- * @returns {Promise<{success: boolean, error?: string}>}
- */
 async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl) {
+  await stateReady;
+
   if (routingState.size >= MAX_ROUTES) {
     return {
       success: false,
-      error: `Maximum of ${MAX_ROUTES} routing slots are active. Stop one before adding another.`
+      error: `Maximum of ${MAX_ROUTES} routes are active. Stop one first.`
     };
   }
-
   if (routingState.has(tabId)) {
     return { success: false, error: 'This tab is already being routed.' };
   }
 
-  // Validate streamId and deviceId are non-empty strings (basic message validation)
+  // Basic input validation — these come from a trusted extension context,
+  // but validate anyway to catch programming errors early.
   if (!streamId || typeof streamId !== 'string') {
-    return { success: false, error: 'Invalid stream ID.' };
+    return { success: false, error: 'Invalid stream ID received.' };
   }
   if (!deviceId || typeof deviceId !== 'string') {
-    return { success: false, error: 'Invalid device ID.' };
+    return { success: false, error: 'Invalid device ID received.' };
   }
 
   let result;
   try {
-    result = await sendToOffscreen({
-      type: 'START_ROUTING',
-      tabId,
-      streamId,
-      deviceId
-    });
+    result = await sendToOffscreen({ type: 'START_ROUTING', tabId, streamId, deviceId });
   } catch (err) {
     return { success: false, error: err.message };
   }
 
   if (!result?.success) {
-    return { success: false, error: result?.error ?? 'Unknown error from audio engine.' };
+    return { success: false, error: result?.error ?? 'Audio engine returned an unknown error.' };
   }
 
   routingState.set(tabId, {
     streamId,
     deviceId,
-    deviceLabel: deviceLabel || deviceId,
-    tabTitle: tabTitle || `Tab ${tabId}`,
-    tabUrl: tabUrl || '',
-    startedAt: Date.now()
+    deviceLabel: deviceLabel || 'Unknown Device',
+    tabTitle:    tabTitle    || `Tab ${tabId}`,
+    tabUrl:      tabUrl      || '',
+    startedAt:   Date.now()
   });
 
+  await persistState();
   return { success: true };
 }
 
-/**
- * Stop routing audio for a tab and clean up all resources.
- * @param {number} tabId
- * @param {string} [reason] - Optional reason string for logging
- * @returns {Promise<{success: boolean, error?: string}>}
- */
 async function stopRouting(tabId, reason = 'user_requested') {
+  await stateReady;
+
   if (!routingState.has(tabId)) {
     return { success: false, error: 'Tab is not currently being routed.' };
   }
 
-  // Remove from state first to prevent re-entrant calls
+  // Remove from state FIRST so re-entrant calls (e.g., from onRemoved and
+  // ROUTING_STOPPED arriving close together) are no-ops.
   routingState.delete(tabId);
+  await persistState();
 
   try {
     await sendToOffscreen({ type: 'STOP_ROUTING', tabId });
   } catch (err) {
-    // Offscreen may already be gone (e.g., browser restart scenario).
-    // Log the warning but do not surface as an error — state is already cleaned.
-    console.warn(`[SW] stopRouting offscreen message failed (tab ${tabId}): ${err.message}`);
+    // Offscreen may already be gone. State is already cleaned — not an error.
+    console.warn(`[SW] stopRouting offscreen notify failed (tab ${tabId}): ${err.message}`);
   }
 
-  console.log(`[SW] Routing stopped for tab ${tabId}. Reason: ${reason}`);
+  // Close offscreen document when no routes remain to release OS audio resources
+  if (routingState.size === 0 && (await isOffscreenAlive())) {
+    try {
+      await chrome.offscreen.closeDocument();
+      console.log('[SW] All routes ended; closed offscreen document.');
+    } catch (err) {
+      console.warn('[SW] Could not close offscreen document:', err.message);
+    }
+  }
+
+  console.log(`[SW] Route stopped for tab ${tabId}. Reason: ${reason}`);
   return { success: true };
 }
 
-/**
- * Return a serializable snapshot of the current routing state.
- * Called by the popup to render active routes.
- */
 function getState() {
-  const routes = [];
-  for (const [tabId, info] of routingState) {
-    routes.push({ tabId, ...info });
-  }
+  const routes = [...routingState.entries()].map(([tabId, info]) => ({ tabId, ...info }));
   return { routes, maxRoutes: MAX_ROUTES };
 }
 
 // ─── Tab Event Listeners ──────────────────────────────────────────────────────
 
-/** Clean up if a routed tab is closed. */
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (routingState.has(tabId)) {
-    console.log(`[SW] Routed tab ${tabId} closed. Auto-stopping routing.`);
+    console.log(`[SW] Routed tab ${tabId} closed; auto-stopping route.`);
     stopRouting(tabId, 'tab_closed');
   }
 });
 
-/**
- * Clean up if a routed tab navigates to a new URL.
- * The captured MediaStream becomes invalid after navigation.
- */
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // A URL change means the page navigated. The captured MediaStream from the
+  // previous page is invalid. Stop routing to avoid silence or errors.
   if (changeInfo.url && routingState.has(tabId)) {
-    console.log(`[SW] Routed tab ${tabId} navigated. Stopping routing.`);
+    console.log(`[SW] Routed tab ${tabId} navigated; stopping route.`);
     stopRouting(tabId, 'tab_navigated');
   }
 });
@@ -188,16 +264,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // ─── Message Handler ──────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  // Messages targeted at the offscreen document are routed by Chrome's
-  // runtime — we must NOT intercept them here.
+  // Pass-through: messages targeted at the offscreen doc. Chrome's runtime
+  // delivers them; we must not consume them here.
   if (message.target === 'offscreen') return false;
 
   const { type } = message;
 
   switch (type) {
     case 'GET_STATE': {
-      sendResponse(getState());
-      return false;
+      // Wait for reconciliation before returning state, so the popup never
+      // sees a half-restored state immediately after a SW restart.
+      stateReady
+        .then(() => sendResponse(getState()))
+        .catch(() => sendResponse(getState()));
+      return true; // async
     }
 
     case 'START_ROUTING': {
@@ -205,28 +285,33 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl)
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
-      return true; // keep channel open for async response
+      return true;
     }
 
     case 'STOP_ROUTING': {
-      const { tabId } = message;
-      stopRouting(tabId)
+      stopRouting(message.tabId)
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
 
-    /**
-     * Sent by the offscreen document when a MediaStreamTrack ends
-     * unexpectedly (tab closed, stream revoked, device lost).
-     * We update SW state to stay in sync.
-     */
     case 'ROUTING_STOPPED': {
+      // Offscreen notifies us when a track ends unexpectedly (tab closed,
+      // stream revoked, device disconnected). Sync state and persist.
       const { tabId, reason } = message;
-      if (routingState.has(tabId)) {
-        routingState.delete(tabId);
-        console.log(`[SW] Auto-routing-stop received for tab ${tabId}: ${reason}`);
-      }
+      stateReady.then(async () => {
+        if (routingState.has(tabId)) {
+          routingState.delete(tabId);
+          await persistState();
+          console.log(`[SW] Auto-stopped route for tab ${tabId}: ${reason}`);
+          if (routingState.size === 0 && (await isOffscreenAlive())) {
+            try {
+              await chrome.offscreen.closeDocument();
+              console.log('[SW] All routes ended; closed offscreen document.');
+            } catch (_) {}
+          }
+        }
+      }).catch(() => {});
       sendResponse({ received: true });
       return false;
     }

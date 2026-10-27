@@ -63,12 +63,27 @@ async function startRouting(tabId, streamId, deviceId) {
   }
 
   // ── Step 2: Create AudioContext ──────────────────────────────────────────
-  // Match the stream's native sample rate to avoid unnecessary resampling.
-  const trackSettings = stream.getAudioTracks()[0]?.getSettings();
-  const contextOptions = trackSettings?.sampleRate
-    ? { sampleRate: trackSettings.sampleRate }
-    : {};
-  const audioContext = new AudioContext(contextOptions);
+  // Match the stream's native sample rate to avoid unnecessary resampling,
+  // with fallback to default constructor if specific sampleRate is unsupported.
+  let audioContext;
+  try {
+    const trackSettings = stream.getAudioTracks()[0]?.getSettings();
+    const contextOptions = (trackSettings?.sampleRate && trackSettings.sampleRate >= 8000 && trackSettings.sampleRate <= 96000)
+      ? { sampleRate: trackSettings.sampleRate }
+      : {};
+    audioContext = new AudioContext(contextOptions);
+  } catch (_) {
+    audioContext = new AudioContext();
+  }
+
+  // Ensure AudioContext is running; offscreen contexts may initialize as suspended
+  if (audioContext.state === 'suspended') {
+    try {
+      await audioContext.resume();
+    } catch (err) {
+      console.warn(`[Offscreen] AudioContext resume note: ${err.message}`);
+    }
+  }
 
   // ── Step 3: Route to the selected output device ──────────────────────────
   // setSinkId is supported since Chrome 110. We feature-detect defensively.

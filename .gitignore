@@ -1,0 +1,45 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Node.js & dependencies
+node_modules/
+jspm_packages/
+.npm
+.yarn/
+*.tgz
+
+# Logs & debugging
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Build outputs & packaging artifacts
+dist/
+build/
+out/
+*.crx
+*.zip
+*.pem
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.env.local
+
+# Editor & IDE directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
