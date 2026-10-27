@@ -107,10 +107,15 @@ async function init() {
   bindEvents();
 }
 
-// ─── Data Loading ─────────────────────────────────────────────────────────────
+let currentActiveTabId = null;
 
 async function loadTabs() {
-  const tabs = await chrome.tabs.query({});
+  const [tabs, activeTabs] = await Promise.all([
+    chrome.tabs.query({}),
+    chrome.tabs.query({ active: true, currentWindow: true })
+  ]);
+  currentActiveTabId = activeTabs[0]?.id ?? null;
+
   allTabs = tabs
     .filter(t =>
       t.id !== undefined &&
@@ -118,10 +123,13 @@ async function loadTabs() {
       !t.url.startsWith('chrome://') &&
       !t.url.startsWith('chrome-extension://') &&
       !t.url.startsWith('about:') &&
-      !t.url.startsWith('edge://')
+      !t.url.startsWith('edge://') &&
+      !t.url.startsWith('brave://')
     )
     .sort((a, b) => {
-      // Audible tabs first — most likely what the user wants to route
+      // Current active tab first, then audible tabs
+      if (a.id === currentActiveTabId) return -1;
+      if (b.id === currentActiveTabId) return 1;
       if (a.audible && !b.audible) return -1;
       if (!a.audible && b.audible) return  1;
       return 0;
@@ -131,12 +139,9 @@ async function loadTabs() {
 /**
  * Enumerate audio output devices.
  *
- * Chrome always returns device entries from enumerateDevices(), but labels
- * are empty strings unless microphone permission is granted. We assign
- * readable fallback labels so the UI is functional either way.
- *
- * The only device that is always identified by Chrome is deviceId "default",
- * which represents the current system default output.
+ * Browsers intentionally hide device labels and output IDs until the user
+ * grants device permission. When unlocked, actual physical devices with valid
+ * non-empty deviceIds are populated.
  */
 async function loadDevices() {
   let rawDevices;
@@ -146,19 +151,24 @@ async function loadDevices() {
     throw new Error(`enumerateDevices() failed: ${err.message}`);
   }
 
-  const outputs = rawDevices.filter(d => d.kind === 'audiooutput');
+  // Filter for audio outputs, ignoring dummy entries with empty deviceId AND empty label
+  const validOutputs = rawDevices.filter(d => d.kind === 'audiooutput' && (d.deviceId || d.label));
 
-  // Labels are available when mic permission is granted (or was ever granted
-  // for this extension origin in this browser session).
-  hasDeviceLabels = outputs.some(d => d.label && d.label.length > 0);
+  hasDeviceLabels = validOutputs.some(d => d.label && d.label.length > 0);
 
-  audioOutputDevices = outputs.map((d, idx) => ({
-    deviceId: d.deviceId,
-    label: d.label ||
-      (d.deviceId === 'default'        ? 'Default Output' :
-       d.deviceId === 'communications' ? 'Communications Device' :
-       `Output Device ${idx + 1}`)
-  }));
+  if (validOutputs.length > 0) {
+    audioOutputDevices = validOutputs.map((d, idx) => ({
+      deviceId: d.deviceId || 'default',
+      label: d.label ||
+        (d.deviceId === 'default'        ? 'Default Output' :
+         d.deviceId === 'communications' ? 'Communications Device' :
+         `Output Device ${idx + 1}`)
+    }));
+  } else {
+    // Permission not yet granted — browser has stripped all device IDs and labels
+    audioOutputDevices = [];
+    hasDeviceLabels = false;
+  }
 }
 
 async function loadState() {
@@ -255,11 +265,12 @@ function populateTabSelect(select) {
 function populateDeviceSelect(select) {
   const selectedBefore = select.value;
   let html = '<option value="">Select device…</option>';
-  audioOutputDevices.forEach(d => {
-    html += `<option value="${d.deviceId}">${escHtml(truncate(d.label, 50))}</option>`;
-  });
   if (audioOutputDevices.length === 0) {
-    html = '<option value="">No output devices found</option>';
+    html = '<option value="">Click "Discover Devices" above</option>';
+  } else {
+    audioOutputDevices.forEach(d => {
+      html += `<option value="${d.deviceId}">${escHtml(truncate(d.label, 50))}</option>`;
+    });
   }
   select.innerHTML = html;
   if (selectedBefore && audioOutputDevices.some(d => d.deviceId === selectedBefore)) {
@@ -270,29 +281,27 @@ function populateDeviceSelect(select) {
 // ─── Event Binding ────────────────────────────────────────────────────────────
 
 function bindEvents() {
-  // Optional: reveal device names by granting mic permission.
+  // User-initiated discovery of physical audio devices.
   // getUserMedia tracks are stopped IMMEDIATELY — no audio is recorded.
   showNamesBtn?.addEventListener('click', async () => {
     showNamesBtn.disabled    = true;
-    showNamesBtn.textContent = 'Requesting…';
+    showNamesBtn.textContent = 'Discovering…';
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     } catch (err) {
-      // User declined — not fatal; the extension continues working with generic labels
-      console.warn('[Popup] Mic permission declined:', err.message);
+      console.warn('[Popup] Audio permission declined:', err.message);
       showNamesBtn.disabled    = false;
-      showNamesBtn.textContent = 'Show Names';
+      showNamesBtn.textContent = 'Discover Devices';
+      showSlotError(0, 'Audio device access was not granted. Please allow audio access in your browser to list devices.');
       return;
     } finally {
-      // Always stop tracks immediately — we do not retain mic audio under any circumstances
       stream?.getTracks().forEach(t => t.stop());
     }
 
     await loadDevices();
     renderRouting();
     infoBanner.classList.toggle('hidden', hasDeviceLabels);
-    // If we got labels, button is no longer needed (banner hides it)
   });
 
   refreshBtn?.addEventListener('click', async () => {
@@ -371,10 +380,17 @@ async function handleStart(slot) {
   try {
     streamId = await getStreamId(tabId);
   } catch (err) {
-    showSlotError(slot,
-      `Could not capture audio from this tab: ${err.message}. ` +
-      `Try clicking inside the tab first, then retry.`
-    );
+    if (err.message && err.message.includes('Extension has not been invoked')) {
+      showSlotError(slot,
+        `Browser security requires opening the extension popup directly on "${truncate(tabTitle, 22)}". ` +
+        `Switch to that tab and click the extension icon to route it.`
+      );
+    } else {
+      showSlotError(slot,
+        `Could not capture audio from this tab: ${err.message}. ` +
+        `Try clicking inside the tab first, then retry.`
+      );
+    }
     el.btn.disabled    = false;
     el.btn.textContent = 'Start Routing';
     return;
@@ -489,7 +505,8 @@ function getSelectedTabId(slot) {
 }
 
 function tabDisplayName(tab) {
-  return tab.title || tab.url || `Tab ${tab.id}`;
+  const name = tab.title || tab.url || `Tab ${tab.id}`;
+  return tab.id === currentActiveTabId ? `★ ${name} (Active Tab)` : name;
 }
 
 function truncate(str, maxLen) {

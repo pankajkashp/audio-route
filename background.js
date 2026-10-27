@@ -150,11 +150,20 @@ async function ensureOffscreenDocument() {
 
 async function sendToOffscreen(message) {
   await ensureOffscreenDocument();
-  try {
-    return await chrome.runtime.sendMessage({ ...message, target: 'offscreen' });
-  } catch (err) {
-    throw new Error(`Offscreen message failed (${message.type}): ${err.message}`);
+  let lastErr;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await chrome.runtime.sendMessage({ ...message, target: 'offscreen' });
+    } catch (err) {
+      lastErr = err;
+      if (err.message && err.message.includes('Receiving end does not exist')) {
+        await new Promise(r => setTimeout(r, 60));
+        continue;
+      }
+      throw new Error(`Offscreen message failed (${message.type}): ${err.message}`);
+    }
   }
+  throw new Error(`Offscreen message failed (${message.type}): ${lastErr?.message || 'timeout'}`);
 }
 
 // ─── Routing Operations ───────────────────────────────────────────────────────

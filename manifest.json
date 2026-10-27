@@ -10,7 +10,8 @@
     "tabCapture",
     "offscreen",
     "tabs",
-    "storage"
+    "storage",
+    "activeTab"
   ],
 
   "background": {
