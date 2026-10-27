@@ -275,6 +275,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     }
 
+    case 'GET_AUDIO_STATUS': {
+      const routesStatus = [];
+      for (const [id, route] of activeRoutes.entries()) {
+        const track = route.stream?.getAudioTracks()[0];
+        routesStatus.push({
+          tabId: id,
+          streamActive: Boolean(route.stream?.active),
+          trackState: track?.readyState ?? 'none',
+          contextState: route.audioContext?.state ?? 'none',
+          sinkId: route.audioContext?.sinkId ?? ''
+        });
+      }
+      sendResponse({ success: true, routes: routesStatus });
+      return false;
+    }
+
     default:
       sendResponse({ success: false, error: `Unknown message type: ${type}` });
       return false;

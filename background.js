@@ -168,17 +168,18 @@ async function sendToOffscreen(message) {
 
 // ─── Routing Operations ───────────────────────────────────────────────────────
 
-async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl) {
+async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot) {
   await stateReady;
+
+  if (routingState.has(tabId)) {
+    return { success: false, error: 'This tab is already being routed.' };
+  }
 
   if (routingState.size >= MAX_ROUTES) {
     return {
       success: false,
       error: `Maximum of ${MAX_ROUTES} routes are active. Stop one first.`
     };
-  }
-  if (routingState.has(tabId)) {
-    return { success: false, error: 'This tab is already being routed.' };
   }
 
   // Basic input validation — these come from a trusted extension context,
@@ -207,6 +208,7 @@ async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, ta
     deviceLabel: deviceLabel || 'Unknown Device',
     tabTitle:    tabTitle    || `Tab ${tabId}`,
     tabUrl:      tabUrl      || '',
+    slot:        typeof slot === 'number' ? slot : undefined,
     startedAt:   Date.now()
   });
 
@@ -290,8 +292,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case 'START_ROUTING': {
-      const { tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl } = message;
-      startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl)
+      const { tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot } = message;
+      startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot)
+        .then(sendResponse)
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+    }
+
+    case 'GET_AUDIO_STATUS': {
+      (async () => {
+        if (!(await isOffscreenAlive())) {
+          return { success: true, routes: [] };
+        }
+        return await sendToOffscreen({ type: 'GET_AUDIO_STATUS' });
+      })()
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;

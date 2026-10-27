@@ -35,13 +35,19 @@
         human-readable device names (e.g. "AirPods Pro" instead of "Device 1").
         Routing works correctly without it; device IDs are always present.
       -->
+      <!-- Info banner for device discovery -->
       <div id="info-banner" class="info-banner hidden">
-        <span class="info-text">
-          Audio devices are protected by browser privacy. Click to discover available outputs.
-        </span>
-        <button id="show-names-btn" class="btn btn-primary btn-sm" type="button">
-          Discover Devices
-        </button>
+        <div class="info-banner-body">
+          <span id="info-text" class="info-text">
+            Physical audio devices require a one-time permission setup.
+          </span>
+          <p id="discovery-error" class="discovery-error hidden"></p>
+        </div>
+        <div class="info-banner-actions">
+          <button id="show-names-btn" class="btn btn-primary btn-sm" type="button">
+            Setup Devices
+          </button>
+        </div>
       </div>
 
       <!-- Route Slot 1 -->

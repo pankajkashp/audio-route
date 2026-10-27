@@ -159,11 +159,32 @@ main {
   margin-bottom: 2px;
 }
 
-.info-text {
+.info-banner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   flex: 1;
+}
+
+.info-text {
   font-size: 11px;
   color: var(--warning);
   line-height: 1.45;
+}
+
+.discovery-error {
+  font-size: 10.5px;
+  color: var(--danger);
+  line-height: 1.4;
+  margin-top: 3px;
+  word-break: break-word;
+}
+
+.info-banner-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-end;
 }
 
 /* ── Route Cards ────────────────────────────────────────── */
