@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tab Audio Router</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <img src="icons/icon48.png" alt="" class="header-logo" width="24" height="24">
+      <span class="header-title">Tab Audio Router</span>
+    </div>
+    <div id="status-badge" class="status-badge status-idle">Idle</div>
+  </header>
+
+  <!-- Main content area — switches between permission view and routing view -->
+  <main id="main-content">
+
+    <!-- ── Permission Screen ─────────────────────────────── -->
+    <section id="permission-screen" class="screen hidden">
+      <div class="permission-card">
+        <div class="permission-icon">🎙️</div>
+        <h2 class="permission-title">One-time setup required</h2>
+        <p class="permission-body">
+          To list your audio output devices (speakers, headphones, etc.),
+          Chrome requires a one-time microphone permission grant.
+          <strong>No microphone audio will be captured or stored.</strong>
+          The permission is used only to unlock device names.
+        </p>
+        <button id="grant-permission-btn" class="btn btn-primary btn-full">
+          <span class="btn-icon">🔓</span>
+          Grant Permission
+        </button>
+        <p id="permission-error" class="permission-error hidden"></p>
+      </div>
+    </section>
+
+    <!-- ── Routing Screen ────────────────────────────────── -->
+    <section id="routing-screen" class="screen hidden">
+
+      <!-- Route Slot 1 -->
+      <div class="route-card" id="route-card-0" data-slot="0">
+        <div class="route-card-header">
+          <div class="slot-label">
+            <span class="slot-number">Route 1</span>
+            <span class="status-dot" id="status-dot-0"></span>
+          </div>
+          <span class="slot-status-text" id="slot-status-text-0">Not active</span>
+        </div>
+
+        <div class="route-card-body">
+          <div class="field-group">
+            <label class="field-label" for="tab-select-0">Tab</label>
+            <div class="select-wrapper">
+              <select id="tab-select-0" class="field-select" aria-label="Select tab for route 1">
+                <option value="">Select a tab…</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="device-select-0">Output Device</label>
+            <div class="select-wrapper">
+              <select id="device-select-0" class="field-select" aria-label="Select output device for route 1">
+                <option value="">Select device…</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="route-card-actions">
+            <button id="route-btn-0" class="btn btn-primary" data-slot="0" disabled>
+              Start Routing
+            </button>
+          </div>
+
+          <p id="slot-error-0" class="slot-error hidden"></p>
+        </div>
+      </div>
+
+      <!-- Route Slot 2 -->
+      <div class="route-card" id="route-card-1" data-slot="1">
+        <div class="route-card-header">
+          <div class="slot-label">
+            <span class="slot-number">Route 2</span>
+            <span class="status-dot" id="status-dot-1"></span>
+          </div>
+          <span class="slot-status-text" id="slot-status-text-1">Not active</span>
+        </div>
+
+        <div class="route-card-body">
+          <div class="field-group">
+            <label class="field-label" for="tab-select-1">Tab</label>
+            <div class="select-wrapper">
+              <select id="tab-select-1" class="field-select" aria-label="Select tab for route 2">
+                <option value="">Select a tab…</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="device-select-1">Output Device</label>
+            <div class="select-wrapper">
+              <select id="device-select-1" class="field-select" aria-label="Select output device for route 2">
+                <option value="">Select device…</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="route-card-actions">
+            <button id="route-btn-1" class="btn btn-primary" data-slot="1" disabled>
+              Start Routing
+            </button>
+          </div>
+
+          <p id="slot-error-1" class="slot-error hidden"></p>
+        </div>
+      </div>
+
+      <!-- Refresh button -->
+      <div class="toolbar">
+        <button id="refresh-btn" class="btn btn-ghost btn-sm" title="Refresh tab and device lists">
+          <span>↺</span> Refresh
+        </button>
+      </div>
+
+    </section>
+
+    <!-- ── Error Screen (Chrome version / API unavailable) ─── -->
+    <section id="error-screen" class="screen hidden">
+      <div class="error-card">
+        <div class="error-icon">⚠️</div>
+        <h2 class="error-title">Browser not supported</h2>
+        <p id="error-message" class="error-body"></p>
+      </div>
+    </section>
+
+    <!-- ── Loading Screen ─────────────────────────────────── -->
+    <section id="loading-screen" class="screen">
+      <div class="loading-spinner"></div>
+    </section>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span class="footer-text">🔒 Audio never leaves your device</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

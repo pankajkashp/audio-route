@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Tab Audio Router – Audio Engine</title>
+</head>
+<body>
+  <!--
+    This document is intentionally invisible to the user.
+    It exists solely to host AudioContext instances and getUserMedia calls,
+    which cannot run in a Manifest V3 service worker (no DOM/Media APIs).
+
+    Security note: This page contains no user-visible UI, no external
+    resources, and no remote code. All audio is processed in memory and
+    routed to the selected local output device. No audio is recorded,
+    stored, or transmitted.
+  -->
+  <script src="offscreen.js"></script>
+</body>
+</html>
