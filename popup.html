@@ -39,13 +39,13 @@
       <div id="info-banner" class="info-banner hidden">
         <div class="info-banner-body">
           <span id="info-text" class="info-text">
-            Physical audio devices require a one-time permission setup.
+            Physical device names are protected by browser privacy. Click Discover Devices to display your hardware outputs. Audio is never recorded.
           </span>
           <p id="discovery-error" class="discovery-error hidden"></p>
         </div>
         <div class="info-banner-actions">
           <button id="show-names-btn" class="btn btn-primary btn-sm" type="button">
-            Setup Devices
+            Discover Devices
           </button>
         </div>
       </div>
@@ -74,6 +74,15 @@
               <select id="device-select-0" class="field-select" aria-label="Select output device for route 1">
                 <option value="">Select device…</option>
               </select>
+            </div>
+          </div>
+          <div class="field-group volume-group" id="volume-group-0">
+            <div class="volume-header">
+              <label class="field-label" for="volume-slider-0">Volume</label>
+              <span class="volume-value" id="volume-value-0">100%</span>
+            </div>
+            <div class="slider-wrapper">
+              <input type="range" id="volume-slider-0" class="volume-slider" min="0" max="100" value="100" step="1" aria-label="Volume for route 1">
             </div>
           </div>
           <div class="route-card-actions">
@@ -109,6 +118,15 @@
               <select id="device-select-1" class="field-select" aria-label="Select output device for route 2">
                 <option value="">Select device…</option>
               </select>
+            </div>
+          </div>
+          <div class="field-group volume-group" id="volume-group-1">
+            <div class="volume-header">
+              <label class="field-label" for="volume-slider-1">Volume</label>
+              <span class="volume-value" id="volume-value-1">100%</span>
+            </div>
+            <div class="slider-wrapper">
+              <input type="range" id="volume-slider-1" class="volume-slider" min="0" max="100" value="100" step="1" aria-label="Volume for route 2">
             </div>
           </div>
           <div class="route-card-actions">

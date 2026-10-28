@@ -66,13 +66,15 @@ const SLOTS = [0, 1];
 
 function slotEl(slot) {
   return {
-    card:       $(`route-card-${slot}`),
-    tabSelect:  $(`tab-select-${slot}`),
-    devSelect:  $(`device-select-${slot}`),
-    btn:        $(`route-btn-${slot}`),
-    dot:        $(`status-dot-${slot}`),
-    statusText: $(`slot-status-text-${slot}`),
-    error:      $(`slot-error-${slot}`)
+    card:         $(`route-card-${slot}`),
+    tabSelect:    $(`tab-select-${slot}`),
+    devSelect:    $(`device-select-${slot}`),
+    volumeSlider: $(`volume-slider-${slot}`),
+    volumeValue:  $(`volume-value-${slot}`),
+    btn:          $(`route-btn-${slot}`),
+    dot:          $(`status-dot-${slot}`),
+    statusText:   $(`slot-status-text-${slot}`),
+    error:        $(`slot-error-${slot}`)
   };
 }
 
@@ -117,43 +119,23 @@ async function init() {
     return;
   }
 
-  // Handle ?setup=1 query parameter if opened from setup button
-  const urlParams = new URLSearchParams(window.location.search);
-  const isSetupMode = urlParams.get('setup') === '1';
-
   renderRouting();
   showScreen('routing');
 
-  if (isSetupMode) {
-    if (hasDeviceLabels) {
-      infoBanner.classList.remove('hidden');
-      if (infoText) {
-        infoText.textContent = '✓ Audio devices discovered! You can close this tab and route audio from any tab using the toolbar icon.';
-      }
-      showNamesBtn.classList.add('hidden');
-    } else {
-      infoBanner.classList.remove('hidden');
-      if (infoText) {
-        infoText.textContent = 'Click "Grant Access" below to allow Brave to discover your physical audio output devices.';
-      }
-      showNamesBtn.textContent = 'Grant Access';
-    }
-  } else {
-    infoBanner.classList.toggle('hidden', hasDeviceLabels);
-  }
-
+  infoBanner.classList.toggle('hidden', hasDeviceLabels);
   bindEvents();
 }
 
 async function loadTabs() {
-  const [tabs, activeTabs, currentTab] = await Promise.all([
+  const [tabs, activeTabsLastFocused, activeTabsCurrent, currentTab] = await Promise.all([
     chrome.tabs.query({}),
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }),
     chrome.tabs.query({ active: true, currentWindow: true }),
     new Promise(res => chrome.tabs.getCurrent(res))
   ]);
 
   isStandalonePage = Boolean(currentTab);
-  currentActiveTab = activeTabs[0] ?? null;
+  currentActiveTab = activeTabsLastFocused[0] || activeTabsCurrent[0] || null;
 
   allTabs = tabs.filter(t =>
     t.id !== undefined &&
@@ -247,6 +229,11 @@ function renderSlot(slot, route) {
     el.tabSelect.disabled  = true;
     el.devSelect.disabled  = true;
 
+    const vol = (typeof route.volume === 'number' && !isNaN(route.volume)) ? route.volume : 100;
+    el.volumeSlider.value = vol;
+    el.volumeValue.textContent = `${vol}%`;
+    el.volumeSlider.disabled = false;
+
     el.btn.textContent = 'Stop Routing';
     el.btn.className   = 'btn btn-danger';
     el.btn.disabled    = false;
@@ -277,9 +264,15 @@ function renderSlot(slot, route) {
         el.statusText.textContent = 'Ready to route';
         el.statusText.className   = 'slot-status-text';
       }
+      el.volumeSlider.disabled = false;
+      if (!el.volumeSlider.dataset.userModified) {
+        el.volumeSlider.value = 100;
+        el.volumeValue.textContent = '100%';
+      }
     } else {
       // Secondary idle slot: waiting for user to switch tabs
       el.devSelect.disabled = true;
+      el.volumeSlider.disabled = true;
       el.statusText.textContent = `Waiting for Tab ${slot + 1}`;
       el.statusText.className   = 'slot-status-text';
     }
@@ -386,52 +379,48 @@ function updateStartButton(slot) {
 function bindEvents() {
   showNamesBtn?.addEventListener('click', async () => {
     clearDiscoveryError();
-
-    // If running in a popup and selectAudioOutput is not available, open setup in a tab
-    // to avoid Chromium's PERMISSION_DISMISSED rejection on popup bubbles.
-    if (!isStandalonePage && typeof navigator?.mediaDevices?.selectAudioOutput !== 'function') {
-      chrome.tabs.create({ url: chrome.runtime.getURL('popup.html?setup=1') });
-      return;
-    }
-
     showNamesBtn.disabled    = true;
     showNamesBtn.textContent = 'Discovering…';
 
-    // 1. Prefer explicit audio output selection if supported
-    if (typeof navigator?.mediaDevices?.selectAudioOutput === 'function') {
-      try {
-        await navigator.mediaDevices.selectAudioOutput();
-        await loadDevices();
-        renderRouting();
-        showNamesBtn.disabled    = false;
-        showNamesBtn.textContent = 'Setup Devices';
-        infoBanner.classList.toggle('hidden', hasDeviceLabels);
-        return;
-      } catch (err) {
-        if (err.name === 'NotAllowedError') {
-          showNamesBtn.disabled    = false;
-          showNamesBtn.textContent = 'Setup Devices';
-          showDiscoveryError(`Audio output selection dismissed: ${err.message}`);
-          return;
-        }
-        console.warn('[Popup] selectAudioOutput unsupported or failed, falling back:', err);
-      }
-    }
-
-    // 2. getUserMedia in tab context to unlock enumerateDevices() labels
+    // 1. Direct device discovery right inside the popup (no unnecessary tabs)
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     } catch (err) {
-      console.error('[Popup] Audio permission error:', err);
+      console.warn('[Popup] Audio device discovery error:', err);
       showNamesBtn.disabled    = false;
-      showNamesBtn.textContent = 'Setup Devices';
-      const exactErr = `${err.name}: ${err.message || 'Permission denied or dismissed'}`;
-      let guidance = exactErr;
-      if (err.name === 'NotAllowedError') {
-        guidance += '. Permission was dismissed. Check brave://settings/content/microphone.';
+      showNamesBtn.textContent = 'Discover Devices';
+
+      let isDenied = false;
+      try {
+        const perm = await navigator.permissions.query({ name: 'microphone' });
+        isDenied = (perm.state === 'denied');
+      } catch (_) {}
+
+      if (isDenied) {
+        showDiscoveryError('Device access is blocked in Brave settings. You can allow device access at brave://settings/content/microphone to reveal output device names.');
+      } else if (err.name === 'NotAllowedError') {
+        // Minimal honest fallback only if popup dialog cannot anchor permission prompt:
+        if (!isStandalonePage) {
+          showDiscoveryError('Permission prompt was dismissed. If Brave does not show the prompt inside this popup, you can open a tab to grant permission.');
+          showNamesBtn.textContent = 'Open in Tab';
+          showNamesBtn.onclick = async () => {
+            // Deduplicate: focus existing tab if already open to prevent tab loops
+            const url = chrome.runtime.getURL('popup.html');
+            const existing = await chrome.tabs.query({ url: `${url}*` });
+            if (existing.length > 0 && existing[0].id) {
+              await chrome.tabs.update(existing[0].id, { active: true });
+            } else {
+              await chrome.tabs.create({ url });
+            }
+          };
+          return;
+        } else {
+          showDiscoveryError('Permission was dismissed or denied. Check brave://settings/content/microphone.');
+        }
+      } else {
+        showDiscoveryError(`Device discovery error: ${err.name} — ${err.message}`);
       }
-      showDiscoveryError(guidance);
       return;
     } finally {
       stream?.getTracks().forEach(t => t.stop());
@@ -442,24 +431,16 @@ function bindEvents() {
     } catch (err) {
       console.error('[Popup] loadDevices error:', err);
       showNamesBtn.disabled    = false;
-      showNamesBtn.textContent = 'Setup Devices';
+      showNamesBtn.textContent = 'Discover Devices';
       showDiscoveryError(`Device enumeration error: ${err.name} — ${err.message}`);
       return;
     }
 
     showNamesBtn.disabled    = false;
-    showNamesBtn.textContent = 'Setup Devices';
+    showNamesBtn.textContent = 'Discover Devices';
 
     renderRouting();
-    if (isStandalonePage && hasDeviceLabels) {
-      infoBanner.classList.remove('hidden');
-      if (infoText) {
-        infoText.textContent = '✓ Audio devices discovered! You can now close this tab and route audio from any tab using the toolbar icon.';
-      }
-      showNamesBtn.classList.add('hidden');
-    } else {
-      infoBanner.classList.toggle('hidden', hasDeviceLabels);
-    }
+    infoBanner.classList.toggle('hidden', hasDeviceLabels);
   });
 
   refreshBtn?.addEventListener('click', async () => {
@@ -479,6 +460,26 @@ function bindEvents() {
     const el = slotEl(slot);
     el.tabSelect.addEventListener('change', () => updateStartButton(slot));
     el.devSelect.addEventListener('change', () => updateStartButton(slot));
+
+    // Live volume changes without restarting capture
+    el.volumeSlider.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10);
+      el.volumeValue.textContent = `${val}%`;
+      el.volumeSlider.dataset.userModified = 'true';
+      const route = getRouteForSlot(slot);
+      if (route && route.tabId) {
+        chrome.runtime.sendMessage({
+          type: 'SET_VOLUME',
+          tabId: route.tabId,
+          volume: val
+        }).then(res => {
+          if (res?.success) {
+            route.volume = val;
+          }
+        }).catch(err => console.warn('[Popup] Live volume update error:', err));
+      }
+    });
+
     el.btn.addEventListener('click', () => {
       if (el.btn.classList.contains('btn-danger')) {
         handleStop(slot);
@@ -504,6 +505,7 @@ async function handleStart(slot) {
 
   const tabId    = getSelectedTabId(slot);
   const deviceId = el.devSelect.value;
+  const volume   = parseInt(el.volumeSlider?.value ?? '100', 10);
 
   if (!tabId || !deviceId) {
     showSlotError(slot, 'Select both a tab and an output device first.');
@@ -545,7 +547,8 @@ async function handleStart(slot) {
       type: 'START_ROUTING',
       tabId, streamId, deviceId, deviceLabel, tabTitle,
       tabUrl: tab?.url || '',
-      slot
+      slot,
+      volume
     });
   } catch (err) {
     showSlotError(slot, `Extension error: ${err.message}`);
@@ -562,7 +565,7 @@ async function handleStart(slot) {
   }
 
   // Update local mirror and re-render
-  activeRoutes.set(tabId, { tabId, streamId, deviceId, deviceLabel, tabTitle, slot });
+  activeRoutes.set(tabId, { tabId, streamId, deviceId, deviceLabel, tabTitle, slot, volume });
   renderRouting();
 }
 

@@ -129,7 +129,7 @@ async function testAuthorizationSecurity() {
       'https://example.com'
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    await wait(1200);
+    const secConn = await connectToBrave(portSec);
 
     const popTargetRes = await fetch(`http://127.0.0.1:${portSec}/json/new?chrome-extension://${extId}/popup.html`, { method: 'PUT' });
     const popTarget = await popTargetRes.json();
@@ -198,6 +198,7 @@ async function testAuthorizationSecurity() {
     console.log('  ✓ Validation test verified: Errors are NEVER mistaken for valid stream IDs.\n');
 
     ws.close();
+    if (secConn?.ws) secConn.ws.close();
   } finally {
     if (braveProc) {
       braveProc.kill('SIGTERM');
@@ -366,12 +367,40 @@ async function testFullRoutingWorkflow() {
     assert.strictEqual(s1?.audioRoutes?.length, 1, 'Expected 1 active route in Offscreen engine');
     assert.strictEqual(s1?.audioRoutes[0]?.trackState, 'live', 'Audio track is not live in offscreen engine');
     assert.strictEqual(s1?.audioRoutes[0]?.contextState, 'running', 'AudioContext is not running in offscreen engine');
-    console.log('  ✓ Route 1 started: Service Worker + Offscreen audio engine verified live and running.\n');
+    assert.strictEqual(s1?.audioRoutes[0]?.volume, 100, 'Default volume in offscreen engine must be 100%');
+    console.log('  ✓ Route 1 started: Service Worker + Offscreen audio engine verified live and running with default volume 100%.\n');
 
     const tabAId = s1.tabAId;
 
-    // ─── Test 5: Real User Workflow — Step 2: Switch Tabs & Start Route 2 ──
-    console.log('[Test 5] Real Workflow Step 2: Opening Tab B, switching active tab, and starting Route 2...');
+    // ─── Test 5: Independent Volume Control — Live Adjustment on Route 1 ───
+    console.log('[Test 5] Testing live volume change on Route 1 (live GainNode adjustment without restarting capture)...');
+    const vol1Eval = await pSend('Runtime.evaluate', {
+      expression: `(async () => {
+        const setRes = await chrome.runtime.sendMessage({
+          type: 'SET_VOLUME',
+          tabId: ${tabAId},
+          volume: 50
+        });
+        const audioStatus = await chrome.runtime.sendMessage({ type: 'GET_AUDIO_STATUS' });
+        const swState = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+        return {
+          setRes,
+          routeAudio: audioStatus.routes.find(r => r.tabId === ${tabAId}),
+          swRoute: swState.routes.find(r => r.tabId === ${tabAId})
+        };
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    });
+    const v1 = vol1Eval.result?.result?.value;
+    assert.ok(v1?.setRes?.success, `SET_VOLUME failed: ${v1?.setRes?.error}`);
+    assert.strictEqual(v1?.routeAudio?.volume, 50, 'Offscreen GainNode volume was not updated to 50%');
+    assert.strictEqual(v1?.swRoute?.volume, 50, 'Service Worker stored volume was not updated to 50%');
+    assert.strictEqual(v1?.routeAudio?.trackState, 'live', 'Audio track was disrupted during volume change');
+    console.log('  ✓ Route 1 volume updated live to 50% without restarting capture (track remained live).\n');
+
+    // ─── Test 6: Volume Independence Between Simultaneous Routes ───────────
+    console.log('[Test 6] Starting Route 2 with volume 80% and verifying GainNode independence...');
     
     // Open Tab B (example.org)
     await fetch(`http://127.0.0.1:${portDyn}/json/new?https://example.org`, { method: 'PUT' });
@@ -404,7 +433,15 @@ async function testFullRoutingWorkflow() {
           deviceLabel: 'System Default',
           tabTitle: 'Example Org (Tab B)',
           tabUrl: targetB.url,
-          slot: 1
+          slot: 1,
+          volume: 80
+        });
+
+        // Now change Route 2 volume to 25% live
+        const setRes2 = await chrome.runtime.sendMessage({
+          type: 'SET_VOLUME',
+          tabId: targetB.id,
+          volume: 25
         });
 
         const audioStatus2 = await chrome.runtime.sendMessage({ type: 'GET_AUDIO_STATUS' });
@@ -413,8 +450,10 @@ async function testFullRoutingWorkflow() {
         return {
           tabBId: targetB.id,
           startRes2,
+          setRes2,
           swRouteCount: swState2.routes.length,
-          audioRoutes: audioStatus2.routes
+          audioRoutes: audioStatus2.routes,
+          swRoutes: swState2.routes
         };
       })()`,
       awaitPromise: true,
@@ -422,7 +461,8 @@ async function testFullRoutingWorkflow() {
     });
 
     const s2 = step2Eval.result?.result?.value;
-    assert.ok(s2?.startRes2?.success, `Route 2 failed to start: ${s2?.startRes2?.error}`);
+    assert.ok(s2?.startRes2?.success, `Route 2 failed to start: ${JSON.stringify(s2?.startRes2)}`);
+    assert.ok(s2?.setRes2?.success, `Route 2 SET_VOLUME failed: ${JSON.stringify(s2?.setRes2)}`);
     assert.strictEqual(s2?.swRouteCount, 2, 'Expected 2 active routes in Service Worker');
     assert.strictEqual(s2?.audioRoutes?.length, 2, 'Expected 2 active routes in Offscreen audio engine');
 
@@ -430,12 +470,38 @@ async function testFullRoutingWorkflow() {
     const routeB = s2.audioRoutes.find(r => r.tabId === s2.tabBId);
     assert.ok(routeA && routeA.trackState === 'live' && routeA.contextState === 'running', 'Route 1 was disrupted when Route 2 started');
     assert.ok(routeB && routeB.trackState === 'live' && routeB.contextState === 'running', 'Route 2 is not live in offscreen engine');
-    console.log('  ✓ Two simultaneous routes verified active with independent live tracks and running AudioContexts.\n');
+
+    // Crucial check: changing Route 2 to 25% must NOT have affected Route 1 (which was set to 50%)
+    assert.strictEqual(routeA.volume, 50, 'Route 1 volume was corrupted by Route 2 volume change!');
+    assert.strictEqual(routeB.volume, 25, 'Route 2 volume was not set to 25%');
+    console.log('  ✓ Two simultaneous routes verified active with independent GainNodes (Route 1: 50%, Route 2: 25%).\n');
 
     const tabBId = s2.tabBId;
 
-    // ─── Test 6: Enforce Constraints (Duplicate & Max Routes) ──────────────
-    console.log('[Test 6] Testing duplicate route prevention and 2-route capacity limit...');
+    // ─── Test 7: Volume Input Validation ───────────────────────────────────
+    console.log('[Test 7] Validating volume boundary values and error rejection...');
+    const volValEval = await pSend('Runtime.evaluate', {
+      expression: `(async () => {
+        const negRes = await chrome.runtime.sendMessage({ type: 'SET_VOLUME', tabId: ${tabAId}, volume: -10 });
+        const overRes = await chrome.runtime.sendMessage({ type: 'SET_VOLUME', tabId: ${tabAId}, volume: 150 });
+        const nanRes = await chrome.runtime.sendMessage({ type: 'SET_VOLUME', tabId: ${tabAId}, volume: 'not-a-number' });
+        return {
+          negRejected: !negRes.success,
+          overRejected: !overRes.success,
+          nanRejected: !nanRes.success
+        };
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    });
+    const vv = volValEval.result?.result?.value;
+    assert.ok(vv.negRejected, 'Negative volume was unexpectedly accepted');
+    assert.ok(vv.overRejected, 'Volume > 100 was unexpectedly accepted');
+    assert.ok(vv.nanRejected, 'Non-numeric volume was unexpectedly accepted');
+    console.log('  ✓ Out-of-bounds volume inputs (-10, 150, NaN) strictly rejected with validation errors.\n');
+
+    // ─── Test 8: Enforce Constraints (Duplicate & Max Routes) ──────────────
+    console.log('[Test 8] Testing duplicate route prevention and 2-route capacity limit...');
     const limitEval = await pSend('Runtime.evaluate', {
       expression: `(async () => {
         // 1. Duplicate route on Tab A
@@ -470,8 +536,8 @@ async function testFullRoutingWorkflow() {
     assert.ok(limRes.thirdRejected && limRes.thirdError.includes('Maximum of 2 routes are active'), '3rd route overflow was not rejected');
     console.log('  ✓ Duplicate routes and 3rd route overflow strictly prevented.\n');
 
-    // ─── Test 7: Independent Route Stoppage ─────────────────────────────────
-    console.log('[Test 7] Real Workflow Step 3: Stopping Route 1 independently...');
+    // ─── Test 9: Independent Route Stoppage ─────────────────────────────────
+    console.log('[Test 9] Real Workflow Step 3: Stopping Route 1 independently...');
     const stop1Eval = await pSend('Runtime.evaluate', {
       expression: `(async () => {
         // Stop Route 1 (Tab A)
@@ -520,8 +586,8 @@ async function testFullRoutingWorkflow() {
     assert.strictEqual(stop2Res.audioCountAfter2, 0, 'Expected 0 routes in offscreen engine');
     console.log('  ✓ Route 2 stopped cleanly; all audio pipelines closed and offscreen engine torn down.\n');
 
-    // ─── Test 8: Tab Closure Auto-Cleanup ──────────────────────────────────
-    console.log('[Test 8] Testing automatic route cleanup upon tab closure (tabs.onRemoved)...');
+    // ─── Test 10: Tab Closure Auto-Cleanup ─────────────────────────────────
+    console.log('[Test 10] Testing automatic route cleanup upon tab closure (tabs.onRemoved)...');
     const closeEval = await pSend('Runtime.evaluate', {
       expression: `(async () => {
         const streamId = await new Promise((resolve, reject) => {
@@ -553,12 +619,13 @@ async function testFullRoutingWorkflow() {
       returnByValue: true
     });
     const closeRes = closeEval.result?.result?.value;
+    assert.ok(closeRes, `Test 10 evaluate threw: ${JSON.stringify(closeEval.result?.exceptionDetails || closeEval.result)}`);
     assert.strictEqual(closeRes.swRoutes, 0, 'Route for closed tab was not auto-cleaned in SW');
     assert.strictEqual(closeRes.audioRoutes, 0, 'Route for closed tab was not auto-cleaned in offscreen engine');
     console.log('  ✓ Tab closure cleanly auto-terminated route in both SW and offscreen engine.\n');
 
-    // ─── Test 9: Partial Failure Teardown & Recovery ───────────────────────
-    console.log('[Test 9] Testing recovery and teardown after partial failure (invalid sink ID)...');
+    // ─── Test 11: Partial Failure Teardown & Clean Recovery ────────────────
+    console.log('[Test 11] Testing recovery and teardown after partial failure (invalid sink ID)...');
     const partialFailEval = await pSend('Runtime.evaluate', {
       expression: `(async () => {
         const streamId = await new Promise((resolve, reject) => {
@@ -596,10 +663,29 @@ async function testFullRoutingWorkflow() {
     assert.strictEqual(pfRes.leftoverOffscreen, 0, 'Failed route left dangling stream in offscreen engine');
     console.log('  ✓ Offscreen setSinkId failure aborted cleanly with 0 orphaned state in SW or offscreen engine.\n');
 
+    // ─── Test 12: In-Popup Direct Device Discovery UX Validation ───────────
+    console.log('[Test 12] Validating in-popup direct device discovery without setup tab...');
+    const discEval = await pSend('Runtime.evaluate', {
+      expression: `(async () => {
+        const devList = await navigator.mediaDevices.enumerateDevices();
+        const outputs = devList.filter(d => d.kind === 'audiooutput');
+        return {
+          raw: devList.map(d => ({ kind: d.kind, id: d.deviceId, label: d.label })),
+          outputCount: outputs.length,
+          outputs: outputs.map(d => ({ id: d.deviceId, label: d.label }))
+        };
+      })()`,
+      awaitPromise: true,
+      returnByValue: true
+    });
+    const dRes = discEval.result?.result?.value;
+    assert.ok(dRes?.outputCount > 0, `No audio output devices discovered: ${JSON.stringify(dRes)}`);
+    console.log(`  ✓ Real physical devices discovered directly (${dRes.outputCount} output devices verified).\n`);
+
     popupWs.close();
     root.ws.close();
     console.log('===========================================================');
-    console.log('       ALL 9 AUTOMATED VALIDATION CHECKS PASSED           ');
+    console.log('       ALL 12 AUTOMATED VALIDATION CHECKS PASSED          ');
     console.log('===========================================================\n');
 
   } finally {

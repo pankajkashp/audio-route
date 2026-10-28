@@ -130,34 +130,41 @@ async function isOffscreenAlive() {
   return existing.length > 0;
 }
 
-/**
- * Creates the offscreen document if it does not already exist.
- * Declared reasons:
- *   USER_MEDIA    — we call getUserMedia(chromeMediaSource:'tab')
- *   AUDIO_PLAYBACK — we play audio back through AudioContext + setSinkId
- */
+let creatingOffscreenPromise = null;
+
 async function ensureOffscreenDocument() {
   if (await isOffscreenAlive()) return;
-
-  await chrome.offscreen.createDocument({
-    url: 'offscreen.html',
-    reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
-    justification:
-      'Capture tab audio via getUserMedia (chromeMediaSource: tab) and play it ' +
-      'through an AudioContext routed to a specific output device via setSinkId().'
-  });
+  if (creatingOffscreenPromise) {
+    return creatingOffscreenPromise;
+  }
+  creatingOffscreenPromise = (async () => {
+    try {
+      if (await isOffscreenAlive()) return;
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
+        justification:
+          'Capture tab audio via getUserMedia (chromeMediaSource: tab) and play it ' +
+          'through an AudioContext routed to a specific output device via setSinkId().'
+      });
+    } finally {
+      creatingOffscreenPromise = null;
+    }
+  })();
+  return creatingOffscreenPromise;
 }
 
 async function sendToOffscreen(message) {
   await ensureOffscreenDocument();
   let lastErr;
-  for (let attempt = 0; attempt < 5; attempt++) {
+  // Bounded retry (up to 25 attempts, 100ms interval = 2.5s) to absorb cold offscreen document startup
+  for (let attempt = 0; attempt < 25; attempt++) {
     try {
       return await chrome.runtime.sendMessage({ ...message, target: 'offscreen' });
     } catch (err) {
       lastErr = err;
       if (err.message && err.message.includes('Receiving end does not exist')) {
-        await new Promise(r => setTimeout(r, 60));
+        await new Promise(r => setTimeout(r, 100));
         continue;
       }
       throw new Error(`Offscreen message failed (${message.type}): ${err.message}`);
@@ -168,7 +175,7 @@ async function sendToOffscreen(message) {
 
 // ─── Routing Operations ───────────────────────────────────────────────────────
 
-async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot) {
+async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot, volume) {
   await stateReady;
 
   if (routingState.has(tabId)) {
@@ -191,14 +198,28 @@ async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, ta
     return { success: false, error: 'Invalid device ID received.' };
   }
 
+  const numVol = Number(volume);
+  const validVol = (!isNaN(numVol) && numVol >= 0 && numVol <= 100) ? numVol : 100;
+
   let result;
   try {
-    result = await sendToOffscreen({ type: 'START_ROUTING', tabId, streamId, deviceId });
+    result = await sendToOffscreen({ type: 'START_ROUTING', tabId, streamId, deviceId, volume: validVol });
   } catch (err) {
+    // If the first route attempt fails before starting, clean up offscreen document
+    if (routingState.size === 0 && (await isOffscreenAlive())) {
+      try { await chrome.offscreen.closeDocument(); } catch (_) {}
+    }
     return { success: false, error: err.message };
   }
 
   if (!result?.success) {
+    // Ensure a failed first route attempt leaves no orphaned offscreen document
+    if (routingState.size === 0 && (await isOffscreenAlive())) {
+      try {
+        await chrome.offscreen.closeDocument();
+        console.log('[SW] Cleaned up offscreen document after failed first route attempt.');
+      } catch (_) {}
+    }
     return { success: false, error: result?.error ?? 'Audio engine returned an unknown error.' };
   }
 
@@ -209,6 +230,7 @@ async function startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, ta
     tabTitle:    tabTitle    || `Tab ${tabId}`,
     tabUrl:      tabUrl      || '',
     slot:        typeof slot === 'number' ? slot : undefined,
+    volume:      validVol,
     startedAt:   Date.now()
   });
 
@@ -247,6 +269,26 @@ async function stopRouting(tabId, reason = 'user_requested') {
 
   console.log(`[SW] Route stopped for tab ${tabId}. Reason: ${reason}`);
   return { success: true };
+}
+
+async function setVolume(tabId, volume) {
+  await stateReady;
+  if (!routingState.has(tabId)) {
+    return { success: false, error: 'Tab is not currently being routed.' };
+  }
+  const num = Number(volume);
+  if (isNaN(num) || num < 0 || num > 100) {
+    return { success: false, error: 'Volume must be a number between 0 and 100.' };
+  }
+  const routeInfo = routingState.get(tabId);
+  routeInfo.volume = num;
+  await persistState();
+
+  try {
+    return await sendToOffscreen({ type: 'SET_VOLUME', tabId, volume: num });
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 }
 
 function getState() {
@@ -292,8 +334,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case 'START_ROUTING': {
-      const { tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot } = message;
-      startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot)
+      const { tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot, volume } = message;
+      startRouting(tabId, streamId, deviceId, deviceLabel, tabTitle, tabUrl, slot, volume)
+        .then(sendResponse)
+        .catch(err => sendResponse({ success: false, error: err.message }));
+      return true;
+    }
+
+    case 'SET_VOLUME': {
+      const { tabId, volume } = message;
+      setVolume(tabId, volume)
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true;

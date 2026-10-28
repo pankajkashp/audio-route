@@ -37,28 +37,45 @@ const activeRoutes = new Map();
  * @param {string} deviceId  - Target audio output device ID
  * @returns {Promise<{success: boolean, error?: string}>}
  */
-async function startRouting(tabId, streamId, deviceId) {
+async function startRouting(tabId, streamId, deviceId, volume = 100) {
   // Idempotent: stop any existing route for this tab before creating a new one
   if (activeRoutes.has(tabId)) {
     await cleanup(tabId);
   }
 
   // ── Step 1: Materialise the captured stream ──────────────────────────────
+  // Bounded retry (1 retry after 100ms) only for transient initialization races (AbortError/NotReadableError)
   let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        mandatory: {
-          chromeMediaSource: 'tab',
-          chromeMediaSourceId: streamId
-        }
-      },
-      video: false
-    });
-  } catch (err) {
+  let lastGUMError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          mandatory: {
+            chromeMediaSource: 'tab',
+            chromeMediaSourceId: streamId
+          }
+        },
+        video: false
+      });
+      break;
+    } catch (err) {
+      lastGUMError = err;
+      if (attempt === 0 && (err.name === 'AbortError' || err.name === 'NotReadableError')) {
+        await new Promise(r => setTimeout(r, 100));
+        continue;
+      }
+      return {
+        success: false,
+        error: `getUserMedia failed: ${err.name} — ${err.message}`
+      };
+    }
+  }
+
+  if (!stream) {
     return {
       success: false,
-      error: `getUserMedia failed: ${err.name} — ${err.message}`
+      error: `getUserMedia failed: ${lastGUMError?.name ?? 'UnknownError'} — ${lastGUMError?.message ?? 'No stream produced'}`
     };
   }
 
@@ -95,7 +112,7 @@ async function startRouting(tabId, streamId, deviceId) {
     } catch (err) {
       // Clean up before returning
       stream.getTracks().forEach(t => t.stop());
-      await audioContext.close();
+      try { await audioContext.close(); } catch (_) {}
       return {
         success: false,
         error: `setSinkId failed: ${err.name} — ${err.message}. ` +
@@ -103,20 +120,39 @@ async function startRouting(tabId, streamId, deviceId) {
       };
     }
   } else {
-    // Browser too old — should not happen given minimum_chrome_version: 116
-    // but handle gracefully: audio will play through system default.
     console.warn(`[Offscreen] AudioContext.setSinkId is not available (tab ${tabId}). ` +
                  `Audio will route to the system default output.`);
   }
 
-  // ── Step 4: Connect source → destination ────────────────────────────────
-  // This is what actually re-enables audio playback for the captured tab.
-  // Without this connection, tabCapture's automatic suppression causes silence.
+  // ── Step 4: Connect source → GainNode → destination ──────────────────────
+  // An independent GainNode per route controls volume live without restarting capture.
   const sourceNode = audioContext.createMediaStreamSource(stream);
-  sourceNode.connect(audioContext.destination);
+  const gainNode = audioContext.createGain();
+
+  // Validate and apply initial gain (0.0 to 1.0)
+  const numVol = Number(volume);
+  const initialPercent = (!isNaN(numVol) && numVol >= 0 && numVol <= 100) ? numVol : 100;
+  const initialGain = initialPercent / 100;
+  gainNode.gain.setValueAtTime(initialGain, audioContext.currentTime);
+
+  sourceNode.connect(gainNode);
+  gainNode.connect(audioContext.destination);
+
+  // Resume again if AudioContext entered suspended state during node connections
+  if (audioContext.state === 'suspended') {
+    try {
+      await audioContext.resume();
+    } catch (_) {}
+  }
 
   // ── Step 5: Store state ──────────────────────────────────────────────────
-  activeRoutes.set(tabId, { stream, audioContext, sourceNode });
+  activeRoutes.set(tabId, {
+    stream,
+    audioContext,
+    sourceNode,
+    gainNode,
+    volume: initialPercent
+  });
 
   // ── Step 6: Register lifecycle listeners ────────────────────────────────
   const audioTrack = stream.getAudioTracks()[0];
@@ -128,7 +164,7 @@ async function startRouting(tabId, streamId, deviceId) {
     }, { once: true });
   }
 
-  console.log(`[Offscreen] Routing active for tab ${tabId} → device "${deviceId}"`);
+  console.log(`[Offscreen] Routing active for tab ${tabId} → device "${deviceId}" (vol: ${initialPercent}%)`);
   return { success: true };
 }
 
@@ -161,10 +197,11 @@ async function cleanup(tabId) {
   // Remove from map first to prevent re-entrant cleanup
   activeRoutes.delete(tabId);
 
-  const { stream, audioContext, sourceNode } = route;
+  const { stream, audioContext, sourceNode, gainNode } = route;
 
   // Disconnect Web Audio nodes
   try { sourceNode?.disconnect(); } catch (_) { /* ignore */ }
+  try { gainNode?.disconnect(); } catch (_) { /* ignore */ }
 
   // Stop all MediaStream tracks
   if (stream) {
@@ -176,6 +213,34 @@ async function cleanup(tabId) {
   // Close AudioContext — releases OS-level audio hooks
   if (audioContext && audioContext.state !== 'closed') {
     try { await audioContext.close(); } catch (_) { /* ignore */ }
+  }
+}
+
+/**
+ * Set live volume for an active route without restarting capture.
+ * @param {number} tabId
+ * @param {number} volume - Percentage (0 to 100)
+ * @returns {{success: boolean, error?: string, volume?: number}}
+ */
+function setVolume(tabId, volume) {
+  const route = activeRoutes.get(tabId);
+  if (!route) {
+    return { success: false, error: 'Route not found for tab.' };
+  }
+
+  const num = Number(volume);
+  if (isNaN(num) || num < 0 || num > 100) {
+    return { success: false, error: 'Volume must be a number between 0 and 100.' };
+  }
+
+  const gainValue = num / 100;
+  try {
+    route.gainNode.gain.setValueAtTime(gainValue, route.audioContext.currentTime);
+    route.volume = num;
+    console.log(`[Offscreen] Live volume updated for tab ${tabId} → ${num}% (gain: ${gainValue})`);
+    return { success: true, volume: num };
+  } catch (err) {
+    return { success: false, error: `Failed to set volume: ${err.message}` };
   }
 }
 
@@ -253,7 +318,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   switch (type) {
     case 'START_ROUTING': {
-      const { streamId, deviceId } = message;
+      const { streamId, deviceId, volume } = message;
       if (!streamId || typeof streamId !== 'string') {
         sendResponse({ success: false, error: 'Invalid streamId.' });
         return false;
@@ -262,10 +327,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ success: false, error: 'Invalid deviceId.' });
         return false;
       }
-      startRouting(tabId, streamId, deviceId)
+      startRouting(tabId, streamId, deviceId, volume)
         .then(sendResponse)
         .catch(err => sendResponse({ success: false, error: err.message }));
       return true; // async response
+    }
+
+    case 'SET_VOLUME': {
+      const { volume } = message;
+      const res = setVolume(tabId, volume);
+      sendResponse(res);
+      return false;
     }
 
     case 'STOP_ROUTING': {
@@ -284,7 +356,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           streamActive: Boolean(route.stream?.active),
           trackState: track?.readyState ?? 'none',
           contextState: route.audioContext?.state ?? 'none',
-          sinkId: route.audioContext?.sinkId ?? ''
+          sinkId: route.audioContext?.sinkId ?? '',
+          volume: route.volume ?? 100
         });
       }
       sendResponse({ success: true, routes: routesStatus });
