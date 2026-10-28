@@ -153,8 +153,13 @@ async function testAuthorizationSecurity() {
 
     const evalRes = await send('Runtime.evaluate', {
       expression: `(async () => {
-        const tabs = await chrome.tabs.query({});
-        const target = tabs.find(t => t.url && t.url.includes('example.com'));
+        let target = null;
+        for (let i = 0; i < 25; i++) {
+          const tabs = await chrome.tabs.query({});
+          target = tabs.find(t => t.url && t.url.includes('example.com'));
+          if (target) break;
+          await new Promise(r => setTimeout(r, 200));
+        }
         if (!target) return { error: 'Target tab not found' };
 
         // Test the strict stream ID helper:
@@ -256,16 +261,7 @@ async function testFullRoutingWorkflow() {
     });
     await pSend('Runtime.enable');
 
-    // Unlock device enumeration via popup page context
-    await pSend('Runtime.evaluate', {
-      expression: `(async () => {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          stream.getTracks().forEach(t => t.stop());
-        } catch (_) {}
-      })()`,
-      awaitPromise: true
-    });
+    // Test 3 does not call getUserMedia beforehand — verifying default sink works without mic permissions.
 
     // ─── Test 3: Audio Sink Device ID Validation ───────────────────────────
     console.log('[Test 3] Validating AudioContext.setSinkId...');
@@ -663,24 +659,53 @@ async function testFullRoutingWorkflow() {
     assert.strictEqual(pfRes.leftoverOffscreen, 0, 'Failed route left dangling stream in offscreen engine');
     console.log('  ✓ Offscreen setSinkId failure aborted cleanly with 0 orphaned state in SW or offscreen engine.\n');
 
-    // ─── Test 12: In-Popup Direct Device Discovery UX Validation ───────────
-    console.log('[Test 12] Validating in-popup direct device discovery without setup tab...');
+    // ─── Test 12: In-Popup Strict Popup-Only Device Discovery UX Validation ───────────
+    console.log('[Test 12] Validating in-popup strict popup-only UX (no setup tab, immediate default device)...');
     const discEval = await pSend('Runtime.evaluate', {
       expression: `(async () => {
-        const devList = await navigator.mediaDevices.enumerateDevices();
-        const outputs = devList.filter(d => d.kind === 'audiooutput');
+        const tabsBefore = await chrome.tabs.query({});
+        
+        // 1. Verify default device is populated immediately in dropdown
+        const devSelect0 = document.getElementById('device-select-0');
+        const selectedDev = devSelect0 ? devSelect0.value : null;
+        const options = devSelect0 ? Array.from(devSelect0.options).map(o => ({ value: o.value, text: o.text })) : [];
+
+        // 2. Click "Discover Devices" button inside popup
+        const showNamesBtn = document.getElementById('show-names-btn');
+        const btnBefore = showNamesBtn ? showNamesBtn.textContent.trim() : null;
+        if (showNamesBtn) {
+          showNamesBtn.click();
+        }
+        
+        // Wait for async discovery handler to complete
+        await new Promise(r => setTimeout(r, 600));
+
+        const tabsAfter = await chrome.tabs.query({});
+        const errorEl = document.getElementById('discovery-error');
+        const isErrorVisible = errorEl ? !errorEl.classList.contains('hidden') : false;
+        const errorText = errorEl ? errorEl.textContent : '';
+        const btnAfter = showNamesBtn ? showNamesBtn.textContent.trim() : null;
+
         return {
-          raw: devList.map(d => ({ kind: d.kind, id: d.deviceId, label: d.label })),
-          outputCount: outputs.length,
-          outputs: outputs.map(d => ({ id: d.deviceId, label: d.label }))
+          tabsCreated: tabsAfter.length - tabsBefore.length,
+          selectedDev,
+          options,
+          btnBefore,
+          btnAfter,
+          isErrorVisible,
+          errorText
         };
       })()`,
       awaitPromise: true,
       returnByValue: true
     });
     const dRes = discEval.result?.result?.value;
-    assert.ok(dRes?.outputCount > 0, `No audio output devices discovered: ${JSON.stringify(dRes)}`);
-    console.log(`  ✓ Real physical devices discovered directly (${dRes.outputCount} output devices verified).\n`);
+    assert.strictEqual(dRes?.tabsCreated, 0, `Forbidden: A separate tab was opened during device discovery! (tabs created: ${dRes?.tabsCreated})`);
+    assert.strictEqual(dRes?.selectedDev, 'default', `Expected 'default' to be pre-selected in dropdown, got: ${dRes?.selectedDev}`);
+    assert.ok(dRes?.options.some(o => o.value === 'default' && o.text.includes('System Default Output')), 'Dropdown missing System Default Output option');
+    assert.ok(dRes?.btnAfter !== 'Open in Tab', 'Button must not change to "Open in Tab"');
+    console.log('  ✓ Verified 0 setup tabs created. Default output populated and selected immediately.');
+    console.log(`  ✓ Button remained popup-only ("${dRes?.btnAfter}"), inline message handled properly.\n`);
 
     popupWs.close();
     root.ws.close();

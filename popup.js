@@ -1,34 +1,66 @@
 /**
  * popup.js — Extension Popup Controller
  *
- * Permission and Authorization Semantics (verified against Chromium C++ source):
- *
- * 1. Output Device Discovery:
- *    - In Chromium/Brave, an extension popup is an anchored dialog bubble.
- *      Calling getUserMedia() directly inside a toolbar popup triggers
- *      `NotAllowedError: Permission dismissed` because Chromium's PermissionRequestManager
- *      refuses to anchor a permission prompt bubble to another popup dialog.
- *    - To discover physical device names without rejection, clicking "Setup Devices"
- *      opens popup.html in a tab context where the prompt bubble renders cleanly.
- *    - Once granted, permission is permanent for the extension origin
- *      (chrome-extension://<id>) across all future toolbar popups.
- *    - If permission is not yet granted, no fake devices or synthetic IDs are generated.
- *
- * 2. Tab Capture Authorization:
- *    - Under Chromium's activeTab security model (tab_capture_api.cc),
- *      chrome.tabCapture.getMediaStreamId({ targetTabId }) requires the internal
- *      permission `kTabCaptureForTab`, which is only granted to a tab when the user
- *      invokes the extension on that specific tab (e.g. clicking the toolbar action).
- *    - Capturing background tabs that have never been invoked on is strictly forbidden
- *      by Chromium and rejects with:
- *      "Extension has not been invoked for the current page (see activeTab permission)."
- *    - The UI truthfully pre-selects and routes the Current Active Tab.
- *    - To route two tabs, the user opens the extension on Tab 1 to route it,
- *      then opens the extension on Tab 2 to route it. Both run simultaneously
- *      in the offscreen audio engine (up to MAX_ROUTES = 2).
+ * Responsibilities:
+ * - Render and manage routing slots for up to 2 tabs.
+ * - Enumerate and populate audio output devices (Default, Speakers, Bluetooth).
+ * - Handle physical device discovery and permission unlock via modal popup.
+ * - Live volume control (0-100%) without restarting audio capture.
+ * - Validate Chromium tabCapture activeTab security model.
  */
 
 'use strict';
+
+// ─── Grant Window Mode (Modal Permission Prompt) ─────────────────────────────
+
+if (window.location.search.includes('grant=1')) {
+  initGrantWindow();
+} else {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
+  } else {
+    initApp();
+  }
+}
+
+function initGrantWindow() {
+  document.addEventListener('DOMContentLoaded', () => {
+    // Show only the grant screen
+    ['loading-screen', 'routing-screen', 'error-screen'].forEach(id => {
+      document.getElementById(id)?.classList.add('hidden');
+    });
+    const grantScreen = document.getElementById('grant-screen');
+    grantScreen?.classList.remove('hidden');
+
+    const grantBtn = document.getElementById('grant-btn');
+    const grantStatus = document.getElementById('grant-status');
+
+    async function requestAccess() {
+      if (grantBtn) {
+        grantBtn.disabled = true;
+        grantBtn.textContent = 'Requesting…';
+      }
+      if (grantStatus) grantStatus.textContent = 'Please click "Allow" on the browser prompt…';
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(t => t.stop());
+        if (grantStatus) grantStatus.textContent = '✓ Access granted! Detecting devices…';
+        setTimeout(() => window.close(), 400);
+      } catch (err) {
+        if (grantStatus) grantStatus.textContent = 'Permission was dismissed. Click button above to retry.';
+        if (grantBtn) {
+          grantBtn.disabled = false;
+          grantBtn.textContent = 'Allow & Detect Devices';
+        }
+      }
+    }
+
+    grantBtn?.addEventListener('click', requestAccess);
+    // Automatically trigger prompt on load
+    requestAccess();
+  });
+}
 
 // ─── DOM References ───────────────────────────────────────────────────────────
 
@@ -37,30 +69,18 @@ const $ = id => document.getElementById(id);
 const screens = {
   loading: $('loading-screen'),
   routing: $('routing-screen'),
-  error:   $('error-screen')
+  error:   $('error-screen'),
+  grant:   $('grant-screen')
 };
 
-const statusBadge    = $('status-badge');
-const infoBanner     = $('info-banner');
-const infoText       = $('info-text');
-const showNamesBtn   = $('show-names-btn');
-const discoveryError = $('discovery-error');
-const refreshBtn     = $('refresh-btn');
-const errorMessage   = $('error-message');
-
-function showDiscoveryError(msg) {
-  if (discoveryError) {
-    discoveryError.textContent = msg;
-    discoveryError.classList.remove('hidden');
-  }
-}
-
-function clearDiscoveryError() {
-  if (discoveryError) {
-    discoveryError.textContent = '';
-    discoveryError.classList.add('hidden');
-  }
-}
+const statusBadge      = $('status-badge');
+const infoBanner       = $('info-banner');
+const infoText         = $('info-text');
+const unlockDevicesBtn = $('unlock-devices-btn');
+const showNamesBtn     = $('show-names-btn');
+const discoveryError   = $('discovery-error');
+const refreshBtn       = $('refresh-btn');
+const errorMessage     = $('error-message');
 
 const SLOTS = [0, 1];
 
@@ -80,35 +100,23 @@ function slotEl(slot) {
 
 // ─── Application State ────────────────────────────────────────────────────────
 
-let activeRoutes       = new Map(); // tabId → route info (mirrored from SW)
+let activeRoutes       = new Map(); // tabId → route info
 let allTabs            = [];        // all queryable tabs
 let currentActiveTab   = null;      // active tab in current window
-let isStandalonePage   = false;     // true if running as a standalone tab, false if popup
 let audioOutputDevices = [];        // [{deviceId, label}] with verified physical IDs
 let hasDeviceLabels    = false;     // true when real hardware labels are unlocked
 
-// ─── Initialisation ───────────────────────────────────────────────────────────
+// ─── Main Initialization ──────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => {
-  init().catch(err => {
-    console.error('[Popup] Fatal error during init:', err);
-    showError(`Failed to initialise: ${err.message}`);
-  });
-});
-
-async function init() {
+async function initApp() {
   showScreen('loading');
 
-  // Verify required APIs exist (Chrome 116+ needed for offscreen + tabCapture)
   if (
     typeof chrome?.offscreen?.createDocument !== 'function' ||
     typeof chrome?.tabCapture?.getMediaStreamId !== 'function' ||
     typeof navigator?.mediaDevices?.enumerateDevices !== 'function'
   ) {
-    showError(
-      'This extension requires Chrome 116 or later. ' +
-      'Update at chrome://settings/help and reload.'
-    );
+    showError('This extension requires Chrome 116 or later. Please update your browser.');
     return;
   }
 
@@ -121,20 +129,16 @@ async function init() {
 
   renderRouting();
   showScreen('routing');
-
-  infoBanner.classList.toggle('hidden', hasDeviceLabels);
   bindEvents();
 }
 
 async function loadTabs() {
-  const [tabs, activeTabsLastFocused, activeTabsCurrent, currentTab] = await Promise.all([
+  const [tabs, activeTabsLastFocused, activeTabsCurrent] = await Promise.all([
     chrome.tabs.query({}),
     chrome.tabs.query({ active: true, lastFocusedWindow: true }),
-    chrome.tabs.query({ active: true, currentWindow: true }),
-    new Promise(res => chrome.tabs.getCurrent(res))
+    chrome.tabs.query({ active: true, currentWindow: true })
   ]);
 
-  isStandalonePage = Boolean(currentTab);
   currentActiveTab = activeTabsLastFocused[0] || activeTabsCurrent[0] || null;
 
   allTabs = tabs.filter(t =>
@@ -150,9 +154,8 @@ async function loadTabs() {
 
 /**
  * Enumerate audio output devices.
- * Browsers intentionally hide device labels and output IDs until permission
- * is granted to the origin. Only actual physical devices with real hardware
- * labels and valid non-empty deviceIds are populated.
+ * Extracts physical devices (e.g. MacBook Speakers, Bluetooth headphones)
+ * and formats clean labels with system default fallback.
  */
 async function loadDevices() {
   let rawDevices;
@@ -162,27 +165,56 @@ async function loadDevices() {
     throw new Error(`enumerateDevices() failed: ${err.message}`);
   }
 
-  // Filter for audio outputs that have non-empty labels.
-  // In Chromium/Brave, device labels and IDs are blank until permission is granted to the origin.
-  const validOutputs = rawDevices.filter(d => d.kind === 'audiooutput' && d.label && d.label.trim().length > 0);
+  const rawOutputs = rawDevices.filter(d => d.kind === 'audiooutput');
+  const labeledOutputs = rawOutputs.filter(d => d.label && d.label.trim().length > 0);
 
-  hasDeviceLabels = validOutputs.length > 0;
+  hasDeviceLabels = labeledOutputs.length > 0;
 
   if (hasDeviceLabels) {
-    audioOutputDevices = validOutputs.map(d => ({
-      deviceId: d.deviceId || 'default',
-      label: d.label
-    }));
+    const physicalDevices = [];
+    let defaultLabel = 'System Default Output';
+
+    for (const dev of labeledOutputs) {
+      if (dev.deviceId === 'default') {
+        defaultLabel = dev.label.startsWith('Default - ')
+          ? `System Default (${dev.label.replace('Default - ', '')})`
+          : (dev.label || 'System Default Output');
+      } else {
+        if (!physicalDevices.some(p => p.deviceId === dev.deviceId)) {
+          physicalDevices.push({
+            deviceId: dev.deviceId,
+            label: dev.label
+          });
+        }
+      }
+    }
+
+    // Sort physical devices so Built-in Speakers come first, Bluetooth next
+    physicalDevices.sort((a, b) => {
+      const aIsSpeaker = /speaker|built-in|internal/i.test(a.label);
+      const bIsSpeaker = /speaker|built-in|internal/i.test(b.label);
+      if (aIsSpeaker && !bIsSpeaker) return -1;
+      if (!aIsSpeaker && bIsSpeaker) return 1;
+      return a.label.localeCompare(b.label);
+    });
+
+    audioOutputDevices = [
+      ...physicalDevices,
+      { deviceId: 'default', label: defaultLabel }
+    ];
   } else {
-    // Permission not yet granted — browser has stripped all device IDs and labels for privacy.
-    // Never create fake device IDs or generic placeholders.
-    audioOutputDevices = [];
+    audioOutputDevices = [
+      {
+        deviceId: 'default',
+        label: 'System Default Output'
+      }
+    ];
   }
 }
 
 async function loadState() {
   const response = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
-  activeRoutes = new Map((response.routes ?? []).map(r => [r.tabId, r]));
+  activeRoutes = new Map((response?.routes ?? []).map(r => [r.tabId, r]));
 }
 
 // ─── Rendering ────────────────────────────────────────────────────────────────
@@ -191,7 +223,6 @@ function getRouteForSlot(slot) {
   for (const route of activeRoutes.values()) {
     if (route.slot === slot) return route;
   }
-  // Fallback for any legacy route that did not have slot explicitly recorded
   const unassigned = [...activeRoutes.values()].filter(r => r.slot === undefined);
   if (unassigned.length > 0) {
     const otherSlot = slot === 0 ? 1 : 0;
@@ -209,8 +240,34 @@ function renderRouting() {
   });
 
   const n = activeRoutes.size;
-  statusBadge.textContent = n > 0 ? `${n} Active` : 'Idle';
-  statusBadge.className   = `status-badge ${n > 0 ? 'status-active' : 'status-idle'}`;
+  if (statusBadge) {
+    statusBadge.textContent = n > 0 ? `${n} Active` : 'Idle';
+    statusBadge.className   = `status-badge ${n > 0 ? 'status-active' : 'status-idle'}`;
+  }
+
+  updateDeviceModeBanner();
+}
+
+function updateDeviceModeBanner() {
+  if (!infoBanner || !infoText) return;
+
+  if (hasDeviceLabels && audioOutputDevices.length > 1) {
+    infoBanner.className = 'info-banner info-banner-success';
+    infoText.textContent = `Multi-Device Mode: ${audioOutputDevices.length} outputs detected. Assign separate outputs to Route 1 and Route 2.`;
+    unlockDevicesBtn?.classList.add('hidden');
+    if (showNamesBtn) {
+      showNamesBtn.classList.remove('hidden');
+      showNamesBtn.textContent = '↺ Refresh';
+    }
+  } else {
+    infoBanner.className = 'info-banner info-banner-warning';
+    infoText.textContent = 'Default Output Mode: Audio routes to System Default. To route to MacBook Speakers & Bluetooth separately, click Show Connected Devices.';
+    unlockDevicesBtn?.classList.remove('hidden');
+    if (showNamesBtn) {
+      showNamesBtn.classList.remove('hidden');
+      showNamesBtn.textContent = '↺ Refresh Devices';
+    }
+  }
 }
 
 function renderSlot(slot, route) {
@@ -243,26 +300,23 @@ function renderSlot(slot, route) {
     el.card.classList.remove('is-active');
     el.dot.classList.remove('dot-active');
 
-    // Target the first idle slot to route currentActiveTab (Slot 0 if idle, else Slot 1)
     const targetIdleSlot = (!getRouteForSlot(0)) ? 0 : 1;
     const isTargetIdleSlot = (slot === targetIdleSlot);
 
     populateTabSelect(slot, el.tabSelect, isTargetIdleSlot);
-    populateDeviceSelect(el.devSelect);
+    populateDeviceSelect(slot, el.devSelect);
 
     el.btn.textContent = 'Start Routing';
     el.btn.className   = 'btn btn-primary';
+    el.devSelect.disabled = (audioOutputDevices.length === 0);
 
     if (isTargetIdleSlot) {
       const isAlreadyRouted = currentActiveTab && activeRoutes.has(currentActiveTab.id);
       if (isAlreadyRouted) {
         el.devSelect.disabled = true;
         el.statusText.textContent = 'Tab already routed';
-        el.statusText.className   = 'slot-status-text';
       } else {
-        el.devSelect.disabled = (audioOutputDevices.length === 0);
         el.statusText.textContent = 'Ready to route';
-        el.statusText.className   = 'slot-status-text';
       }
       el.volumeSlider.disabled = false;
       if (!el.volumeSlider.dataset.userModified) {
@@ -270,47 +324,24 @@ function renderSlot(slot, route) {
         el.volumeValue.textContent = '100%';
       }
     } else {
-      // Secondary idle slot: waiting for user to switch tabs
-      el.devSelect.disabled = true;
       el.volumeSlider.disabled = true;
       el.statusText.textContent = `Waiting for Tab ${slot + 1}`;
-      el.statusText.className   = 'slot-status-text';
     }
+    el.statusText.className = 'slot-status-text';
 
     updateStartButton(slot);
   }
 }
 
-/**
- * Populate the tab selector according to Chromium's authorization model.
- * In Manifest V3 with activeTab, only the currently active tab where the
- * extension was invoked has kTabCaptureForTab authorization.
- * Background tabs are NEVER displayed as selectable options because the
- * browser will reject them with "Extension has not been invoked".
- */
 function populateTabSelect(slot, select, isTargetIdleSlot) {
-  let html = '';
-
-  if (isStandalonePage) {
-    html = '<option value="" disabled>To route, open extension on the target tab</option>';
-    select.innerHTML = html;
-    select.disabled = true;
-    if (isTargetIdleSlot) {
-      showSlotError(slot, 'This page is for device setup. To route audio, open any tab and click the extension icon in your toolbar.');
-    }
-    return;
-  }
-
   if (!isTargetIdleSlot) {
-    html = `<option value="" disabled>Switch to another tab to route in Route ${slot + 1}</option>`;
-    select.innerHTML = html;
+    select.innerHTML = `<option value="" disabled>Switch to another tab to route in Route ${slot + 1}</option>`;
     select.disabled = true;
     return;
   }
 
   if (!currentActiveTab || !currentActiveTab.id) {
-    html = '<option value="" disabled>No active tab detected</option>';
-    select.innerHTML = html;
+    select.innerHTML = '<option value="" disabled>No active tab detected</option>';
     select.disabled = true;
     return;
   }
@@ -323,124 +354,127 @@ function populateTabSelect(slot, select, isTargetIdleSlot) {
     currentActiveTab.url.startsWith('edge://');
 
   if (isInternalUrl) {
-    html = '<option value="" disabled>Internal browser page cannot be routed</option>';
-    select.innerHTML = html;
+    select.innerHTML = '<option value="" disabled>Internal browser page cannot be routed</option>';
     select.disabled = true;
     showSlotError(slot, 'Internal browser pages cannot be captured. Switch to a web page (e.g. YouTube) and click the extension icon.');
     return;
   }
 
-  // Check if current active tab is already routed
   if (activeRoutes.has(currentActiveTab.id)) {
     const existingRoute = activeRoutes.get(currentActiveTab.id);
-    html = `<option value="" disabled>Current tab already routed (${escHtml(truncate(existingRoute.deviceLabel, 20))})</option>`;
-    select.innerHTML = html;
+    select.innerHTML = `<option value="" disabled>Current tab already routed (${escHtml(truncate(existingRoute.deviceLabel, 20))})</option>`;
     select.disabled = true;
     showSlotError(slot, `This tab is already being routed. Switch to another tab to route Route ${slot + 1}.`);
     return;
   }
 
-  // The current active tab is available and authorized
   clearSlotError(slot);
-  html = `<option value="${currentActiveTab.id}" selected>Current Tab: ${escHtml(truncate(tabDisplayName(currentActiveTab), 42))}</option>`;
-
-  select.innerHTML = html;
+  select.innerHTML = `<option value="${currentActiveTab.id}" selected>Current Tab: ${escHtml(truncate(tabDisplayName(currentActiveTab), 42))}</option>`;
   select.value = String(currentActiveTab.id);
-  select.disabled = true; // Pre-selected and locked to current tab; user cannot select unroutable background tabs
+  select.disabled = true;
 }
 
-function populateDeviceSelect(select) {
+function populateDeviceSelect(slot, select) {
   const selectedBefore = select.value;
-  let html = '<option value="">Select device…</option>';
+  let html = '';
   if (audioOutputDevices.length === 0) {
-    html = '<option value="">Click "Setup Devices" above</option>';
+    html = '<option value="">No audio outputs detected</option>';
   } else {
     audioOutputDevices.forEach(d => {
       html += `<option value="${d.deviceId}">${escHtml(truncate(d.label, 50))}</option>`;
     });
   }
   select.innerHTML = html;
+
   if (selectedBefore && audioOutputDevices.some(d => d.deviceId === selectedBefore)) {
     select.value = selectedBefore;
+  } else if (audioOutputDevices.length > 0) {
+    if (slot === 1 && audioOutputDevices.length > 1) {
+      // Slot 1 defaults to the bluetooth or second device
+      const bluetoothDev = audioOutputDevices.find(d => /bluetooth|headphone|boult|airpods|buds/i.test(d.label));
+      if (bluetoothDev && bluetoothDev.deviceId !== 'default') {
+        select.value = bluetoothDev.deviceId;
+      } else {
+        select.value = audioOutputDevices[1].deviceId;
+      }
+    } else {
+      // Slot 0 defaults to the first device (e.g. MacBook Air Speakers)
+      select.value = audioOutputDevices[0].deviceId;
+    }
   }
 }
 
 function updateStartButton(slot) {
   const el = slotEl(slot);
-  if (el.btn.classList.contains('btn-danger')) return; // active slot with Stop Routing
+  if (el.btn.classList.contains('btn-danger')) return;
   const tabId = getSelectedTabId(slot);
   const deviceId = el.devSelect.value;
   const isAlreadyRouted = tabId ? activeRoutes.has(tabId) : false;
   el.btn.disabled = !tabId || isAlreadyRouted || !deviceId || audioOutputDevices.length === 0;
 }
 
+// ─── Modal Unlock Dialog ──────────────────────────────────────────────────────
+
+async function openDeviceUnlockDialog() {
+  if (typeof chrome?.windows?.create !== 'function') {
+    await loadDevices();
+    renderRouting();
+    return;
+  }
+
+  if (unlockDevicesBtn) {
+    unlockDevicesBtn.disabled = true;
+    unlockDevicesBtn.textContent = 'Opening…';
+  }
+
+  try {
+    const win = await chrome.windows.create({
+      url: chrome.runtime.getURL('popup.html?grant=1'),
+      type: 'popup',
+      width: 380,
+      height: 260,
+      focused: true
+    });
+
+    const timer = setInterval(async () => {
+      try {
+        const existing = await chrome.windows.get(win.id);
+        if (!existing) throw new Error();
+      } catch (_) {
+        clearInterval(timer);
+        await loadDevices();
+        renderRouting();
+      }
+    }, 300);
+  } catch (err) {
+    console.warn('[Popup] Error opening unlock window:', err);
+    await loadDevices();
+    renderRouting();
+  } finally {
+    if (unlockDevicesBtn) {
+      unlockDevicesBtn.disabled = false;
+      unlockDevicesBtn.textContent = '🎧 Show Connected Devices';
+    }
+  }
+}
+
 // ─── Event Binding ────────────────────────────────────────────────────────────
 
 function bindEvents() {
+  unlockDevicesBtn?.addEventListener('click', openDeviceUnlockDialog);
+
   showNamesBtn?.addEventListener('click', async () => {
-    clearDiscoveryError();
     showNamesBtn.disabled    = true;
-    showNamesBtn.textContent = 'Discovering…';
-
-    // 1. Direct device discovery right inside the popup (no unnecessary tabs)
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    } catch (err) {
-      console.warn('[Popup] Audio device discovery error:', err);
-      showNamesBtn.disabled    = false;
-      showNamesBtn.textContent = 'Discover Devices';
-
-      let isDenied = false;
-      try {
-        const perm = await navigator.permissions.query({ name: 'microphone' });
-        isDenied = (perm.state === 'denied');
-      } catch (_) {}
-
-      if (isDenied) {
-        showDiscoveryError('Device access is blocked in Brave settings. You can allow device access at brave://settings/content/microphone to reveal output device names.');
-      } else if (err.name === 'NotAllowedError') {
-        // Minimal honest fallback only if popup dialog cannot anchor permission prompt:
-        if (!isStandalonePage) {
-          showDiscoveryError('Permission prompt was dismissed. If Brave does not show the prompt inside this popup, you can open a tab to grant permission.');
-          showNamesBtn.textContent = 'Open in Tab';
-          showNamesBtn.onclick = async () => {
-            // Deduplicate: focus existing tab if already open to prevent tab loops
-            const url = chrome.runtime.getURL('popup.html');
-            const existing = await chrome.tabs.query({ url: `${url}*` });
-            if (existing.length > 0 && existing[0].id) {
-              await chrome.tabs.update(existing[0].id, { active: true });
-            } else {
-              await chrome.tabs.create({ url });
-            }
-          };
-          return;
-        } else {
-          showDiscoveryError('Permission was dismissed or denied. Check brave://settings/content/microphone.');
-        }
-      } else {
-        showDiscoveryError(`Device discovery error: ${err.name} — ${err.message}`);
-      }
-      return;
-    } finally {
-      stream?.getTracks().forEach(t => t.stop());
-    }
-
+    showNamesBtn.textContent = 'Refreshing…';
     try {
       await loadDevices();
+      renderRouting();
     } catch (err) {
-      console.error('[Popup] loadDevices error:', err);
+      console.warn('[Popup] Refresh note:', err);
+    } finally {
       showNamesBtn.disabled    = false;
-      showNamesBtn.textContent = 'Discover Devices';
-      showDiscoveryError(`Device enumeration error: ${err.name} — ${err.message}`);
-      return;
+      showNamesBtn.textContent = hasDeviceLabels ? '↺ Refresh' : '↺ Refresh Devices';
     }
-
-    showNamesBtn.disabled    = false;
-    showNamesBtn.textContent = 'Discover Devices';
-
-    renderRouting();
-    infoBanner.classList.toggle('hidden', hasDeviceLabels);
   });
 
   refreshBtn?.addEventListener('click', async () => {
@@ -449,7 +483,6 @@ function bindEvents() {
     try {
       await Promise.all([loadTabs(), loadDevices(), loadState()]);
       renderRouting();
-      infoBanner.classList.toggle('hidden', hasDeviceLabels);
     } finally {
       refreshBtn.disabled    = false;
       refreshBtn.textContent = '↺ Refresh';
@@ -461,7 +494,6 @@ function bindEvents() {
     el.tabSelect.addEventListener('change', () => updateStartButton(slot));
     el.devSelect.addEventListener('change', () => updateStartButton(slot));
 
-    // Live volume changes without restarting capture
     el.volumeSlider.addEventListener('input', (e) => {
       const val = parseInt(e.target.value, 10);
       el.volumeValue.textContent = `${val}%`;
@@ -473,10 +505,8 @@ function bindEvents() {
           tabId: route.tabId,
           volume: val
         }).then(res => {
-          if (res?.success) {
-            route.volume = val;
-          }
-        }).catch(err => console.warn('[Popup] Live volume update error:', err));
+          if (res?.success) route.volume = val;
+        }).catch(err => console.warn('[Popup] Volume error:', err));
       }
     });
 
@@ -489,11 +519,9 @@ function bindEvents() {
     });
   });
 
-  // Re-enumerate when a device is plugged/unplugged
   navigator.mediaDevices.addEventListener('devicechange', async () => {
     await loadDevices();
     renderRouting();
-    infoBanner.classList.toggle('hidden', hasDeviceLabels);
   });
 }
 
@@ -520,27 +548,16 @@ async function handleStart(slot) {
   el.btn.disabled    = true;
   el.btn.textContent = 'Capturing…';
 
-  // Step 1: obtain the stream ID from the tab capture API
   let streamId;
   try {
     streamId = await getStreamId(tabId);
   } catch (err) {
-    if (err.message && err.message.includes('Extension has not been invoked')) {
-      showSlotError(slot,
-        `Browser security requires opening the extension directly on "${truncate(tabTitle, 22)}". ` +
-        `Switch to that tab and click the extension icon to route it.`
-      );
-    } else {
-      showSlotError(slot,
-        `Could not capture audio: ${err.message}. Ensure the tab is playing audio and retry.`
-      );
-    }
+    showSlotError(slot, `Could not capture audio [tabCapture stage]: ${err.message}`);
     el.btn.disabled    = false;
     el.btn.textContent = 'Start Routing';
     return;
   }
 
-  // Step 2: hand off to service worker → offscreen audio engine
   let result;
   try {
     result = await chrome.runtime.sendMessage({
@@ -551,7 +568,7 @@ async function handleStart(slot) {
       volume
     });
   } catch (err) {
-    showSlotError(slot, `Extension error: ${err.message}`);
+    showSlotError(slot, `Extension error [handoff stage]: ${err.message}`);
     el.btn.disabled    = false;
     el.btn.textContent = 'Start Routing';
     return;
@@ -564,7 +581,6 @@ async function handleStart(slot) {
     return;
   }
 
-  // Update local mirror and re-render
   activeRoutes.set(tabId, { tabId, streamId, deviceId, deviceLabel, tabTitle, slot, volume });
   renderRouting();
 }
@@ -590,7 +606,7 @@ async function handleStop(slot) {
   }
 
   if (!result?.success) {
-    showSlotError(slot, result?.error ?? 'Could not stop routing. Try clicking Refresh.');
+    showSlotError(slot, result?.error ?? 'Could not stop routing.');
     el.btn.disabled    = false;
     el.btn.textContent = 'Stop Routing';
     return;
@@ -600,12 +616,6 @@ async function handleStop(slot) {
   renderRouting();
 }
 
-// ─── tabCapture Helper ────────────────────────────────────────────────────────
-
-/**
- * Wrap chrome.tabCapture.getMediaStreamId in a Promise.
- * Must be called from a user-gesture handler on an invoked tab.
- */
 function getStreamId(tabId) {
   return new Promise((resolve, reject) => {
     chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, streamId => {
@@ -623,7 +633,7 @@ function getStreamId(tabId) {
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 function showScreen(name) {
-  Object.keys(screens).forEach(k => screens[k].classList.toggle('hidden', k !== name));
+  Object.keys(screens).forEach(k => screens[k]?.classList.toggle('hidden', k !== name));
 }
 
 function showError(msg) {
@@ -633,14 +643,18 @@ function showError(msg) {
 
 function showSlotError(slot, msg) {
   const el = slotEl(slot).error;
-  el.textContent = msg;
-  el.classList.remove('hidden');
+  if (el) {
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  }
 }
 
 function clearSlotError(slot) {
   const el = slotEl(slot).error;
-  el.textContent = '';
-  el.classList.add('hidden');
+  if (el) {
+    el.textContent = '';
+    el.classList.add('hidden');
+  }
 }
 
 function getSelectedTabId(slot) {

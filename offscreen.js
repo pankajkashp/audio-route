@@ -44,44 +44,29 @@ async function startRouting(tabId, streamId, deviceId, volume = 100) {
   }
 
   // ── Step 1: Materialise the captured stream ──────────────────────────────
-  // Bounded retry (1 retry after 100ms) only for transient initialization races (AbortError/NotReadableError)
+  console.log(`[Offscreen:startRouting] [Stage 1: getUserMedia] Starting tab capture stream for tab ${tabId}...`);
   let stream;
-  let lastGUMError;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          mandatory: {
-            chromeMediaSource: 'tab',
-            chromeMediaSourceId: streamId
-          }
-        },
-        video: false
-      });
-      break;
-    } catch (err) {
-      lastGUMError = err;
-      if (attempt === 0 && (err.name === 'AbortError' || err.name === 'NotReadableError')) {
-        await new Promise(r => setTimeout(r, 100));
-        continue;
-      }
-      return {
-        success: false,
-        error: `getUserMedia failed: ${err.name} — ${err.message}`
-      };
-    }
-  }
-
-  if (!stream) {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: 'tab',
+          chromeMediaSourceId: streamId
+        }
+      },
+      video: false
+    });
+    console.log(`[Offscreen:startRouting] [Stage 1: getUserMedia] Success: Stream obtained with ${stream.getAudioTracks().length} track(s).`);
+  } catch (err) {
+    console.error(`[Offscreen:startRouting] [Stage 1: getUserMedia] FAILED for tab ${tabId}: ${err.name} — ${err.message}`);
     return {
       success: false,
-      error: `getUserMedia failed: ${lastGUMError?.name ?? 'UnknownError'} — ${lastGUMError?.message ?? 'No stream produced'}`
+      error: `[getUserMedia stage failed]: ${err.name} — ${err.message}`
     };
   }
 
   // ── Step 2: Create AudioContext ──────────────────────────────────────────
-  // Match the stream's native sample rate to avoid unnecessary resampling,
-  // with fallback to default constructor if specific sampleRate is unsupported.
+  console.log(`[Offscreen:startRouting] [Stage 2: AudioContext] Initialising AudioContext for tab ${tabId}...`);
   let audioContext;
   try {
     const trackSettings = stream.getAudioTracks()[0]?.getSettings();
@@ -89,54 +74,79 @@ async function startRouting(tabId, streamId, deviceId, volume = 100) {
       ? { sampleRate: trackSettings.sampleRate }
       : {};
     audioContext = new AudioContext(contextOptions);
-  } catch (_) {
-    audioContext = new AudioContext();
+    console.log(`[Offscreen:startRouting] [Stage 2: AudioContext] Created AudioContext (sampleRate: ${audioContext.sampleRate}Hz, state: ${audioContext.state}).`);
+  } catch (err) {
+    console.warn(`[Offscreen:startRouting] [Stage 2: AudioContext] Custom constructor failed (${err.message}); falling back to default constructor.`);
+    try {
+      audioContext = new AudioContext();
+    } catch (ctxErr) {
+      console.error(`[Offscreen:startRouting] [Stage 2: AudioContext] FAILED: ${ctxErr.name} — ${ctxErr.message}`);
+      stream.getTracks().forEach(t => t.stop());
+      return {
+        success: false,
+        error: `[AudioContext stage failed]: ${ctxErr.name} — ${ctxErr.message}`
+      };
+    }
   }
 
   // Ensure AudioContext is running; offscreen contexts may initialize as suspended
   if (audioContext.state === 'suspended') {
     try {
       await audioContext.resume();
+      console.log(`[Offscreen:startRouting] [Stage 2: AudioContext] Resumed context to state: ${audioContext.state}.`);
     } catch (err) {
-      console.warn(`[Offscreen] AudioContext resume note: ${err.message}`);
+      console.warn(`[Offscreen:startRouting] [Stage 2: AudioContext] Resume note: ${err.message}`);
     }
   }
 
   // ── Step 3: Route to the selected output device ──────────────────────────
-  // setSinkId is supported since Chrome 110. We feature-detect defensively.
+  console.log(`[Offscreen:startRouting] [Stage 3: setSinkId] Configuring sink device "${deviceId}" for tab ${tabId}...`);
   if (typeof audioContext.setSinkId === 'function') {
-    // 'default' is a valid sinkId meaning "system default output"
-    const targetSinkId = deviceId === 'default' ? '' : deviceId;
+    // 'default' or empty string represents system default output in W3C Audio Output spec
+    const targetSinkId = (!deviceId || deviceId === 'default') ? '' : deviceId;
     try {
       await audioContext.setSinkId(targetSinkId);
+      console.log(`[Offscreen:startRouting] [Stage 3: setSinkId] Success: AudioContext routed to sink "${audioContext.sinkId}".`);
     } catch (err) {
+      console.error(`[Offscreen:startRouting] [Stage 3: setSinkId] FAILED for device "${deviceId}": ${err.name} — ${err.message}`);
       // Clean up before returning
       stream.getTracks().forEach(t => t.stop());
       try { await audioContext.close(); } catch (_) {}
       return {
         success: false,
-        error: `setSinkId failed: ${err.name} — ${err.message}. ` +
-               `The device may be unavailable or permission was denied.`
+        error: `[setSinkId stage failed]: setSinkId failed: ${err.name} — ${err.message}. The device may be unavailable or disconnected.`
       };
     }
   } else {
-    console.warn(`[Offscreen] AudioContext.setSinkId is not available (tab ${tabId}). ` +
+    console.warn(`[Offscreen:startRouting] [Stage 3: setSinkId] AudioContext.setSinkId is not available (tab ${tabId}). ` +
                  `Audio will route to the system default output.`);
   }
 
   // ── Step 4: Connect source → GainNode → destination ──────────────────────
-  // An independent GainNode per route controls volume live without restarting capture.
-  const sourceNode = audioContext.createMediaStreamSource(stream);
-  const gainNode = audioContext.createGain();
-
-  // Validate and apply initial gain (0.0 to 1.0)
+  console.log(`[Offscreen:startRouting] [Stage 4: audioNodes] Connecting source → GainNode → destination for tab ${tabId}...`);
   const numVol = Number(volume);
   const initialPercent = (!isNaN(numVol) && numVol >= 0 && numVol <= 100) ? numVol : 100;
   const initialGain = initialPercent / 100;
-  gainNode.gain.setValueAtTime(initialGain, audioContext.currentTime);
 
-  sourceNode.connect(gainNode);
-  gainNode.connect(audioContext.destination);
+  let sourceNode, gainNode;
+  try {
+    sourceNode = audioContext.createMediaStreamSource(stream);
+    gainNode = audioContext.createGain();
+
+    gainNode.gain.setValueAtTime(initialGain, audioContext.currentTime);
+
+    sourceNode.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    console.log(`[Offscreen:startRouting] [Stage 4: audioNodes] Pipeline connected with initial volume ${initialPercent}%.`);
+  } catch (err) {
+    console.error(`[Offscreen:startRouting] [Stage 4: audioNodes] FAILED: ${err.name} — ${err.message}`);
+    stream.getTracks().forEach(t => t.stop());
+    try { await audioContext.close(); } catch (_) {}
+    return {
+      success: false,
+      error: `[audioNodes stage failed]: ${err.name} — ${err.message}`
+    };
+  }
 
   // Resume again if AudioContext entered suspended state during node connections
   if (audioContext.state === 'suspended') {

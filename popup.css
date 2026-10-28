@@ -147,14 +147,14 @@ main {
   to { transform: rotate(360deg); }
 }
 
-/* ── Info Banner (optional mic permission for device labels) ── */
+/* ── Info Banner (Device Mode & Output Status) ─────────────── */
 .info-banner {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 8px 12px;
-  background: rgba(245, 158, 11, 0.08);
-  border: 1px solid rgba(245, 158, 11, 0.25);
+  background: rgba(148, 163, 184, 0.05);
+  border: 1px solid rgba(148, 163, 184, 0.15);
   border-radius: var(--radius-md);
   margin-bottom: 2px;
 }
@@ -162,13 +162,30 @@ main {
 .info-banner-body {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   flex: 1;
+}
+
+.info-banner-warning {
+  background: rgba(148, 163, 184, 0.06);
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+.info-banner-warning .info-text {
+  color: var(--text-secondary);
+}
+
+.info-banner-success {
+  background: rgba(34, 211, 238, 0.08);
+  border-color: rgba(34, 211, 238, 0.3);
+}
+
+.info-banner-success .info-text {
+  color: var(--accent-cyan);
 }
 
 .info-text {
   font-size: 11px;
-  color: var(--warning);
   line-height: 1.45;
 }
 
@@ -185,6 +202,7 @@ main {
   flex-direction: column;
   gap: 6px;
   align-items: flex-end;
+  flex-shrink: 0;
 }
 
 /* ── Route Cards ────────────────────────────────────────── */
@@ -503,6 +521,40 @@ main {
   font-size: 12px;
   color: var(--text-secondary);
   line-height: 1.6;
+}
+
+/* ── Grant Screen ────────────────────────────────────────── */
+.grant-card {
+  background: var(--surface);
+  border: 1px solid rgba(34, 211, 238, 0.3);
+  box-shadow: var(--shadow-glow-cyan);
+  border-radius: var(--radius-lg);
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  text-align: center;
+}
+
+.grant-icon { font-size: 34px; }
+
+.grant-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--accent-cyan);
+}
+
+.grant-body {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.grant-status {
+  font-size: 11px;
+  color: var(--accent-cyan);
+  min-height: 16px;
 }
 
 /* ── Footer ─────────────────────────────────────────────── */

@@ -35,17 +35,20 @@
         human-readable device names (e.g. "AirPods Pro" instead of "Device 1").
         Routing works correctly without it; device IDs are always present.
       -->
-      <!-- Info banner for device discovery -->
-      <div id="info-banner" class="info-banner hidden">
+      <!-- Device mode banner -->
+      <div id="info-banner" class="info-banner">
         <div class="info-banner-body">
           <span id="info-text" class="info-text">
-            Physical device names are protected by browser privacy. Click Discover Devices to display your hardware outputs. Audio is never recorded.
+            Default Output Mode: Audio routes to your System Default Output. Both Route 1 and Route 2 can run simultaneously with independent volume controls.
           </span>
           <p id="discovery-error" class="discovery-error hidden"></p>
         </div>
         <div class="info-banner-actions">
-          <button id="show-names-btn" class="btn btn-primary btn-sm" type="button">
-            Discover Devices
+          <button id="unlock-devices-btn" class="btn btn-primary btn-sm hidden" type="button">
+            🎧 Show Connected Devices
+          </button>
+          <button id="show-names-btn" class="btn btn-ghost btn-sm" type="button">
+            ↺ Refresh Devices
           </button>
         </div>
       </div>
@@ -153,6 +156,21 @@
         <div class="error-icon">⚠️</div>
         <h2 class="error-title">Not supported</h2>
         <p id="error-message" class="error-body"></p>
+      </div>
+    </section>
+
+    <!-- ── Grant (Modal unlock for hardware labels) ──────── -->
+    <section id="grant-screen" class="screen hidden">
+      <div class="grant-card">
+        <div class="grant-icon">🎧</div>
+        <h2 class="grant-title">Unlock Connected Devices</h2>
+        <p class="grant-body">
+          Allow browser access to reveal your physical audio outputs (MacBook Speakers & Bluetooth headphones).
+        </p>
+        <button id="grant-btn" class="btn btn-primary" type="button">
+          Allow & Detect Devices
+        </button>
+        <p id="grant-status" class="grant-status"></p>
       </div>
     </section>
 

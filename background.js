@@ -155,22 +155,31 @@ async function ensureOffscreenDocument() {
 }
 
 async function sendToOffscreen(message) {
+  const isColdStart = !(await isOffscreenAlive());
+  if (isColdStart) {
+    console.log(`[SW:sendToOffscreen] [Stage: coldStart] Creating offscreen document for "${message.type}"...`);
+  }
   await ensureOffscreenDocument();
+
   let lastErr;
-  // Bounded retry (up to 25 attempts, 100ms interval = 2.5s) to absorb cold offscreen document startup
-  for (let attempt = 0; attempt < 25; attempt++) {
+  // Bounded check for cold startup while offscreen.js registers onMessage listener
+  for (let attempt = 1; attempt <= 20; attempt++) {
     try {
-      return await chrome.runtime.sendMessage({ ...message, target: 'offscreen' });
+      const response = await chrome.runtime.sendMessage({ ...message, target: 'offscreen' });
+      return response;
     } catch (err) {
       lastErr = err;
       if (err.message && err.message.includes('Receiving end does not exist')) {
+        console.log(`[SW:sendToOffscreen] [Stage: awaitListener] Offscreen listener attaching (attempt ${attempt}/20)...`);
         await new Promise(r => setTimeout(r, 100));
         continue;
       }
-      throw new Error(`Offscreen message failed (${message.type}): ${err.message}`);
+      console.error(`[SW:sendToOffscreen] [Stage: dispatchFailed] (${message.type}): ${err.message}`);
+      throw new Error(`[Offscreen dispatch failed]: ${err.message}`);
     }
   }
-  throw new Error(`Offscreen message failed (${message.type}): ${lastErr?.message || 'timeout'}`);
+  console.error(`[SW:sendToOffscreen] [Stage: timeout] Offscreen document did not respond within 2s (${message.type}): ${lastErr?.message}`);
+  throw new Error(`[Offscreen startup timeout]: Offscreen listener not ready: ${lastErr?.message || 'unknown error'}`);
 }
 
 // ─── Routing Operations ───────────────────────────────────────────────────────
